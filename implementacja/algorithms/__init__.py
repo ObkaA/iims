@@ -6,8 +6,8 @@ from .als import ALS
 
 ALGORITHMS = {
     "Gradient Descent": GradientDescent,
-    "SGD": SGD,
-    "Adam": Adam,
-    "Newton Method": NewtonMethod,
-    "ALS": ALS,
+    "SGD":              SGD,
+    "Adam":             Adam,
+    "Newton Method":    NewtonMethod,
+    "ALS":              ALS,
 }

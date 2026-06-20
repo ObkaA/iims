@@ -20,6 +20,9 @@ def main():
     app.setApplicationName("ConvexML")
     app.setOrganizationName("ML Education")
 
+    # High-DPI
+    # app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
+
     # Monospace default font
     font = QFont("JetBrains Mono", 10)
     font.setStyleHint(QFont.StyleHint.Monospace)

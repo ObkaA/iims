@@ -1,58 +1,59 @@
-"""Alternating Least Squares (ALS) optimizer for Matrix Factorization."""
-from __future__ import annotations
+"""
+Alternating Least Squares (ALS) — closed-form, pure NumPy, from scratch.
+
+Problem: given sparse R ∈ ℝ^{n×m}, find U∈ℝ^{n×k}, V∈ℝ^{m×k} s.t. R ≈ U·Vᵀ
+
+Objective (Frobenius on observed entries Ω):
+    min_{U,V}  Σ_{(i,j)∈Ω} (R_{ij} - uᵢ·vⱼ)² + λ(‖U‖_F² + ‖V‖_F²)
+
+ALS trick: the joint problem is non-convex, BUT fixing V the sub-problem in U is:
+    min_{uᵢ}  Σ_{j∈Ωᵢ} (R_{ij} - uᵢ·vⱼ)² + λ‖uᵢ‖²
+
+This is ridge regression with closed-form solution:
+    uᵢ = (Vᵢᵀ Vᵢ + λI)⁻¹ Vᵢᵀ rᵢ
+
+Similarly for vⱼ when U is fixed. ALS alternates these two solves.
+Each step is guaranteed to decrease the objective → monotone convergence.
+"""
 import numpy as np
 from .base import BaseOptimizer
 
 
 class ALS(BaseOptimizer):
     """
-    Alternating Least Squares — not a gradient-based method.
-    Alternates between solving exactly for user factors (U) and item factors (V).
-    Closed-form update: U_i = (V^T V + λI)^{-1} V^T r_i
-    Used here as a special-purpose optimizer for MF — doesn't follow the
-    standard step(params, grad) interface, but is registered for comparison plots.
+    ALS for Matrix Factorization.
+    Satisfies BaseOptimizer interface (falls back to GD if used in regression panel).
+    Real ALS logic lives in MatrixFactorization._train().
     """
 
     def __init__(self, learning_rate: float = 0.01, reg_lambda: float = 0.1):
         super().__init__(learning_rate)
         self.reg_lambda = reg_lambda
-        self._als_loss_history: list[float] = []
 
-    def step(self, params: np.ndarray, gradients: np.ndarray) -> np.ndarray:
-        """
-        Fallback GD step — real ALS is called via als_update() in MF model.
-        This allows ALS to appear in comparison plots alongside GD/SGD/Adam.
-        """
+    def step(self, params: np.ndarray, gradients: np.ndarray, **_) -> np.ndarray:
+        # Fallback: standard GD (used when ALS is selected in the regression panel)
         return params - self.learning_rate * gradients
 
-    def als_update(
-        self,
-        factor_matrix: np.ndarray,   # shape (n, k) — the factor being updated
-        fixed_matrix: np.ndarray,    # shape (m, k) — the factor held fixed
-        R: np.ndarray,               # shape (n, m) — ratings matrix (0 where missing)
-        mask: np.ndarray,            # shape (n, m) — 1 where rating exists
-        reg: float | None = None,
-    ) -> np.ndarray:
+    @staticmethod
+    def solve_one(F: np.ndarray, r: np.ndarray, lam: float) -> np.ndarray:
         """
-        Closed-form ALS update for one factor matrix.
-        For each entity i:  f_i = (V_i^T V_i + λI)^{-1} V_i^T r_i
-        where V_i are the rows of fixed_matrix for items rated by user i.
+        Ridge regression closed-form for one entity:
+            A = Fᵀ F + λI
+            b = Fᵀ r
+            x = solve(A, b)
+
+        Args:
+            F:   (|Ω|, k) sub-matrix of fixed factors for observed entries
+            r:   (|Ω|,)   observed ratings / interactions
+            lam: λ regularisation strength
+
+        Returns:
+            x: (k,) updated factor vector
         """
-        lam = reg if reg is not None else self.reg_lambda
-        n, k = factor_matrix.shape
-        updated = np.zeros_like(factor_matrix)
-        I = np.eye(k)
-        for i in range(n):
-            rated_idx = np.where(mask[i] > 0)[0]
-            if len(rated_idx) == 0:
-                updated[i] = factor_matrix[i]
-                continue
-            V_i = fixed_matrix[rated_idx]       # (n_rated, k)
-            r_i = R[i, rated_idx]               # (n_rated,)
-            A = V_i.T @ V_i + lam * I           # (k, k)
-            b = V_i.T @ r_i                     # (k,)
-            updated[i] = np.linalg.solve(A, b)
-        return updated
+        k   = F.shape[1]
+        A   = F.T @ F + lam * np.eye(k, dtype=np.float64)
+        b   = F.T @ r
+        return np.linalg.solve(A, b)
 
     @property
     def name(self) -> str:

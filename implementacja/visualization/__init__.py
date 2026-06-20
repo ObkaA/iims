@@ -51,6 +51,48 @@ def _apply_dark(fig: Figure):
             spine.set_edgecolor(COLORS["grid"])
 
 
+def plot_confusion_matrix(
+    matrix: np.ndarray,
+    title: str = "Confusion Matrix",
+    fig: Figure | None = None,
+) -> Figure:
+    """Render a binary confusion matrix with counts and TN/FP/FN/TP labels."""
+    matrix = np.asarray(matrix)
+    if matrix.shape != (2, 2):
+        raise ValueError("Binary confusion matrix must have shape (2, 2).")
+    if fig is None:
+        fig = Figure(figsize=(6, 5), tight_layout=True)
+    fig.clear()
+    ax = fig.add_subplot(111)
+    cmap = LinearSegmentedColormap.from_list(
+        "confusion", [COLORS["surface"], "#1f6feb", "#58a6ff"]
+    )
+    image = ax.imshow(matrix, cmap=cmap, interpolation="nearest")
+    labels = (("TN", "FP"), ("FN", "TP"))
+    threshold = matrix.max() / 2 if matrix.size else 0
+    for row in range(2):
+        for column in range(2):
+            value = int(matrix[row, column])
+            ax.text(
+                column,
+                row,
+                f"{labels[row][column]}\n{value}",
+                ha="center",
+                va="center",
+                fontsize=14,
+                fontweight="bold",
+                color="#ffffff" if value > threshold else COLORS["text"],
+            )
+    ax.set_xticks([0, 1], labels=["Class 0", "Class 1"])
+    ax.set_yticks([0, 1], labels=["Class 0", "Class 1"])
+    ax.set_xlabel("Predicted label")
+    ax.set_ylabel("Actual label")
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    _apply_dark(fig)
+    return fig
+
+
 # ── Loss curve ────────────────────────────────────────────────────────────────
 def plot_loss_curves(histories: dict[str, list[float]], fig: Figure | None = None) -> Figure:
     """histories = {"Optimizer Name": [loss_t0, loss_t1, …]}"""
@@ -82,10 +124,14 @@ def plot_regression_fit(
     ax = fig.add_subplot(111)
     ax.scatter(X[:, 0], y, s=15, color="#58a6ff", alpha=0.5, label="Data", zorder=2)
     x_line = np.linspace(X[:, 0].min() - 0.5, X[:, 0].max() + 0.5, 300)
+    X_line = np.tile(np.median(X, axis=0), (len(x_line), 1))
+    X_line[:, 0] = x_line
+    X_line_aug = np.c_[np.ones(len(x_line)), X_line]
     for name, params in models_params.items():
-        y_line = params[0] + params[1] * x_line
+        y_line = X_line_aug @ params
         ax.plot(x_line, y_line, color=COLORS.get(name, "#fff"), linewidth=2, label=name)
-    ax.set_xlabel("X")
+    xlabel = "Feature 1" if X.shape[1] == 1 else "Feature 1 (others fixed at median)"
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("y")
     ax.set_title("Regression Fit", fontsize=12, fontweight="bold")
     ax.legend(framealpha=0.8)
@@ -107,10 +153,33 @@ def plot_decision_boundary(
     ax = fig.add_subplot(111)
 
     h = 0.05
+    if X.shape[1] == 1:
+        x_min, x_max = X[:, 0].min() - 1, X[:, 0].max() + 1
+        x_line = np.linspace(x_min, x_max, 500)
+        probabilities = model.predict(x_line[:, None])
+        ax.plot(
+            x_line,
+            probabilities,
+            color=COLORS.get(optimizer_name, "#fff"),
+            linewidth=2,
+            label="P(class 1)",
+        )
+        ax.scatter(X[:, 0], y, s=20, c=y, cmap="coolwarm", alpha=0.7, zorder=3)
+        ax.axhline(0.5, color=COLORS["grid"], linestyle="--", linewidth=1)
+        ax.set_xlabel("Feature 1")
+        ax.set_ylabel("Probability / class")
+        ax.set_ylim(-0.08, 1.08)
+        ax.set_title(f"Classification Fit — {optimizer_name}", fontsize=11, fontweight="bold")
+        ax.legend(framealpha=0.8)
+        _apply_dark(fig)
+        return fig
+
     x_min, x_max = X[:, 0].min() - 1, X[:, 0].max() + 1
     y_min, y_max = X[:, 1].min() - 1, X[:, 1].max() + 1
     xx, yy = np.meshgrid(np.arange(x_min, x_max, h), np.arange(y_min, y_max, h))
-    grid = np.c_[xx.ravel(), yy.ravel()]
+    grid = np.tile(np.median(X, axis=0), (xx.size, 1))
+    grid[:, 0] = xx.ravel()
+    grid[:, 1] = yy.ravel()
 
     probs = model.predict(grid).reshape(xx.shape)
     cmap_bg = LinearSegmentedColormap.from_list("bg", ["#1a3a5c", "#3a1a2a"])

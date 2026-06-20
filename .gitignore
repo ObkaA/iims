@@ -1,5 +1,6 @@
 # środowisko Pythona
 .venv/
+.venv-app/
 venv/
 
 # cache Pythona

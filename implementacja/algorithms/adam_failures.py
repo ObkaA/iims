@@ -36,12 +36,9 @@ def scenario_sparse_gradients(n_steps: int = 400):
     Problem: 2-D function where coordinate x₁ receives a gradient only
     once every K steps (simulating a rare feature in NLP/sparse data).
 
-    Why Adam fails here:
-        For x₁, v₁ ≈ 0 between sparse updates. When the gradient
-        finally fires, v̂₁ is still near zero → effective step
-        α/√v̂₁ is HUGE → overshoot past the minimum.
-
-    GD is unaffected: step = α·g, so rare-but-large g → small step α·g.
+    Adam normalizes each coordinate by its recent squared-gradient scale.
+    On a sparse coordinate that normalization can prevent updates from
+    shrinking proportionally to a small raw gradient near the optimum.
 
     Mathematical formulation:
         f(x) = x₀² + x₁²
@@ -79,12 +76,14 @@ def scenario_sparse_gradients(n_steps: int = 400):
 
     return {
         "title":       "Scenario 1 — Sparse Gradients",
-        "subtitle":    f"x₁ gradient fires only once every {K} steps",
+        "subtitle":    f"θ₁ receives a gradient only once every {K} steps",
         "why_fails":   (
-            "Adam's v₂ accumulates near zero between sparse updates.\n"
-            f"When gradient fires at step t={K}, v̂₂≈0  →  step = α/√v̂₂ >> α.\n"
-            "Result: massive overshoot on the rarely-updated dimension.\n\n"
-            "GD is immune: step = α·g regardless of history."
+            "Adam divides each coordinate by the square root of its recent squared gradients.\n"
+            "For a rarely active coordinate this normalization can keep the update close to α,\n"
+            "even after the raw gradient has become small. Sparse corrections may therefore\n"
+            "oscillate around the optimum instead of shrinking smoothly.\n\n"
+            "In this run Adam converges well, but momentum SGD reaches a smaller residual error.\n"
+            "The issue is not an infinite step: ε and bias correction keep the update finite."
         ),
         "results":     results,
         "optimum":     np.array([0.0, 0.0]),
@@ -105,8 +104,8 @@ def scenario_nonstationary(n_steps: int = 600):
 
     Why Adam fails here:
         Adam accumulates v with a long β₂=0.999 memory of PHASE-1 gradients.
-        When the landscape flips, v still encodes the old direction for
-        ~1/(1-0.999)=1000 steps → tiny effective steps in the new direction.
+        When the landscape flips, m initially retains the old signed direction,
+        while v retains the old gradient scale and can reduce new updates.
 
         GD / SGD adapt immediately: no gradient memory.
 
@@ -151,11 +150,11 @@ def scenario_nonstationary(n_steps: int = 600):
         "title":      "Scenario 2 — Non-Stationary Objective",
         "subtitle":   f"Minimum shifts from +5 to -5 at step {T}",
         "why_fails":  (
-            "Adam's β₂=0.999 means v has ~1000-step memory.\n"
-            "After the landscape flips, v still encodes the OLD gradient direction.\n"
-            "→ Adam takes ~1000 steps to 'forget' the old landscape.\n\n"
-            "Lower β₂=0.9 recovers faster (shorter memory, ~10 steps).\n"
-            "GD adapts in 1 step — no memory of past gradients."
+            "After the minimum moves, Adam carries stale optimizer state from phase 1.\n"
+            "The first moment m initially retains the old signed direction, while the second\n"
+            "moment v retains old gradient magnitudes and can reduce the effective step.\n\n"
+            "With β₂=0.9 the scale estimate forgets the past faster than with β₂=0.999.\n"
+            "GD follows the new gradient immediately because it stores no moment estimates."
         ),
         "results":    results,
         "phase_step": T,
@@ -167,36 +166,24 @@ def scenario_nonstationary(n_steps: int = 600):
 # ═════════════════════════════════════════════════════════════════════════════
 def scenario_sharp_vs_flat(n_steps: int = 800):
     """
-    Problem: 1-D loss with one SHARP minimum (good train loss, bad test)
-    and one FLAT minimum (slightly worse train loss, good test).
+    A tilted double-well with two exact minima:
+        sharp/lower training minimum at θ=-1, curvature f''(-1)=3
+        flat/higher training minimum at θ=+1, curvature f''(+1)=1
 
-        f(θ) = 0.4·sin(8θ)·exp(-0.3·θ²)  +  0.05·θ²
-
-    Sharp minimum near θ ≈ -0.4 (low loss, high curvature)
-    Flat minimum near  θ ≈  0   (higher loss, low curvature)
-
-    Why Adam converges to sharp minimum:
-        Adam's adaptive step is α/√v̂ — it SHRINKS the step in noisy/oscillating
-        regions, helping it squeeze into sharp minima. SGD's momentum makes it
-        'roll through' sharp minima and settle in flat ones.
-
-    Wilson et al. (2017) showed this explains Adam's generalisation gap on
-    deep learning tasks: sharp minima found by Adam overfit more than flat
-    minima found by SGD.
+    Starting at θ=-2, Adam and GD settle in the sharp basin. SGD momentum
+    crosses the barrier and settles in the flatter basin. This demonstrates
+    optimizer-dependent implicit bias; it does not itself measure test error.
     """
     def loss_fn(theta):
         t = float(theta[0]) if hasattr(theta, '__len__') else float(theta)
-        return 0.4 * np.sin(8 * t) * np.exp(-0.3 * t**2) + 0.05 * t**2
+        return t**4 / 4 - t**3 / 6 - t**2 / 2 + 0.5 * t + 0.65
 
     def grad_fn(theta):
         t = float(theta[0])
-        dl = (0.4 * 8 * np.cos(8*t) * np.exp(-0.3*t**2)
-              + 0.4 * np.sin(8*t) * (-0.6*t) * np.exp(-0.3*t**2)
-              + 0.1 * t)
-        return np.array([dl])
+        return np.array([(t + 1) * (t - 0.5) * (t - 1)])
 
-    lr = 0.02
-    theta_start = -1.5
+    lr = 0.05
+    theta_start = -2.0
 
     results = {}
     for name, opt_cls, kwargs in [
@@ -208,22 +195,28 @@ def scenario_sharp_vs_flat(n_steps: int = 800):
         results[name] = {"losses": losses, "thetas": thetas}
 
     # Loss landscape for plotting
-    t_grid = np.linspace(-2.5, 2.5, 500)
+    t_grid = np.linspace(-2.2, 2.2, 500)
     l_grid = np.array([loss_fn(t) for t in t_grid])
+    minima = [
+        {"theta": -1.0, "loss": loss_fn(-1.0), "curvature": 3.0, "label": "Sharp minimum"},
+        {"theta": 1.0, "loss": loss_fn(1.0), "curvature": 1.0, "label": "Flat minimum"},
+    ]
 
     return {
         "title":      "Scenario 3 — Sharp vs Flat Minima",
-        "subtitle":   "Adam finds sharp minima → worse generalisation",
+        "subtitle":   "Same landscape, different optimizer bias",
         "why_fails":  (
-            "Adam's adaptive step α/√v̂ shrinks near oscillations → converges to SHARP minima.\n"
-            "Sharp minima: low train loss, high curvature → small perturbation → high test loss.\n\n"
-            "SGD with momentum 'rolls through' sharp valleys and settles in FLAT minima.\n"
-            "Flat minima: slightly higher train loss, but robust to weight perturbations.\n\n"
-            "Reference: Wilson et al. 'The Marginal Value of Momentum for SGD' (2017)"
+            "The marked points are real stationary minima: θ=-1 is three times sharper\n"
+            "than θ=+1 (curvature 3 versus 1). Adam and GD remain in the sharp, lower-loss\n"
+            "basin; SGD momentum crosses the barrier and ends in the flatter basin.\n\n"
+            "A flatter minimum can be more robust to parameter perturbations, but this toy\n"
+            "plot does not prove better test accuracy. It shows optimizer-dependent bias.\n\n"
+            "Related discussion: Wilson et al., 2017, 'The Marginal Value of Adaptive Gradient Methods'."
         ),
         "results":    results,
         "t_grid":     t_grid,
         "l_grid":     l_grid,
+        "minima":     minima,
     }
 
 
@@ -234,19 +227,18 @@ def scenario_bad_hyperparams(n_steps: int = 300):
     """
     Problem: simple 1-D quadratic f(θ) = θ².
 
-    Demonstrate how Adam diverges when β₁ is set too high (≥ 0.999)
-    or learning rate is too large.
+    Demonstrate slow or oscillatory convergence when β₁ is set too high
+    or the learning rate is much too large.
 
     Why diverges:
         m_t = β₁·m_{t-1} + (1-β₁)·g_t
         m̂_t = m_t / (1 - β₁ᵗ)
 
-        For β₁=0.999, the bias correction 1/(1-0.999^t) is huge for small t
-        (correction factor ≈ 1000 at t=1!). With a constant gradient, this
-        inflates m̂ massively in early steps → huge parameter jump.
+        For β₁=0.999, signed-gradient memory decays very slowly, so m can keep
+        pointing in a stale direction after the gradient changes sign.
 
-        For large α with β₁=0.9 (default): the effective step can oscillate
-        around the minimum without converging.
+        For large α with β₁=0.9 (default), updates make large transient
+        oscillations around the minimum before converging.
     """
     loss_fn = lambda p: float(p[0] ** 2)
     grad_fn = lambda p: np.array([2.0 * p[0]])
@@ -255,7 +247,7 @@ def scenario_bad_hyperparams(n_steps: int = 300):
     configs = [
         ("Adam (β₁=0.9, α=0.1)",    Adam, {"learning_rate": 0.1,  "beta1": 0.9,   "beta2": 0.999}),
         ("Adam (β₁=0.999, α=0.1)",  Adam, {"learning_rate": 0.1,  "beta1": 0.999, "beta2": 0.999}),
-        ("Adam (β₁=0.9, α=1.0)",    Adam, {"learning_rate": 1.0,  "beta1": 0.9,   "beta2": 0.999}),
+        ("Adam (β₁=0.9, α=10)",     Adam, {"learning_rate": 10.0, "beta1": 0.9,   "beta2": 0.999}),
         ("GD  (α=0.1)",              GradientDescent, {"learning_rate": 0.1}),
     ]
 
@@ -268,14 +260,15 @@ def scenario_bad_hyperparams(n_steps: int = 300):
 
     return {
         "title":      "Scenario 4 — Hyperparameter Sensitivity",
-        "subtitle":   "Adam diverges with β₁≥0.999 or α too large",
+        "subtitle":   "Long momentum memory and an oversized learning rate",
         "why_fails":  (
-            "β₁=0.999: bias correction 1/(1-β₁ᵗ) ≈ 1000 at t=1.\n"
-            "Early m̂ is 1000× amplified → parameter jumps wildly.\n\n"
-            "Large α=1.0: effective step α/√v̂ >> 1 in early steps before\n"
-            "v̂ accumulates enough history to act as denominator.\n\n"
-            "GD with α=0.1: always stable, step = α·g → bounded update.\n\n"
-            "Lesson: Adam is more sensitive to hyperparameter choice than GD."
+            "Bias correction does not amplify the first gradient 1000×: the (1-β₁) factor\n"
+            "in m cancels that denominator. The real issue with β₁=0.999 is very long\n"
+            "signed-gradient memory, which delays reaction when the gradient changes sign.\n\n"
+            "With α=10 Adam makes large oscillatory transients around θ=0 before settling.\n"
+            "GD with α=0.1 contracts predictably on this quadratic.\n\n"
+            "Lesson: default Adam parameters are robust, but extreme β₁ or α can make\n"
+            "convergence unnecessarily slow or oscillatory."
         ),
         "results":    results,
     }

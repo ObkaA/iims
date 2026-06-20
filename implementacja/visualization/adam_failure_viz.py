@@ -15,7 +15,7 @@ COLORS = {
     "Adam β₂=0.9":     "#78ffd6",
     "Adam (β₁=0.9, α=0.1)":   "#a8ff78",
     "Adam (β₁=0.999, α=0.1)": "#ff6b6b",
-    "Adam (β₁=0.9, α=1.0)":   "#ffd700",
+    "Adam (β₁=0.9, α=10)":    "#ffd700",
     "Gradient Descent": "#00d4ff",
     "GD":               "#00d4ff",
     "GD  (α=0.1)":      "#00d4ff",
@@ -140,6 +140,26 @@ def plot_scenario_sharp_flat(data: dict, fig: Figure) -> Figure:
     ax_land.plot(t_grid, l_grid, color="#58a6ff", lw=2, label="f(θ)")
     ax_land.fill_between(t_grid, l_grid, alpha=0.1, color="#58a6ff")
 
+    minimum_styles = [
+        ("*", "#f78166"),
+        ("D", "#ffd700"),
+    ]
+    for minimum, (marker, color) in zip(data["minima"], minimum_styles):
+        ax_land.scatter(
+            minimum["theta"],
+            minimum["loss"],
+            marker=marker,
+            color=color,
+            edgecolor="#ffffff",
+            linewidth=0.7,
+            s=130,
+            zorder=7,
+            label=(
+                f"{minimum['label']} θ={minimum['theta']:+.0f} "
+                f"(curvature={minimum['curvature']:.0f})"
+            ),
+        )
+
     for name, d in data["results"].items():
         c       = _c(name)
         thetas  = d["thetas"]
@@ -155,7 +175,8 @@ def plot_scenario_sharp_flat(data: dict, fig: Figure) -> Figure:
         ax_loss.semilogy(np.maximum(d["losses"], 1e-8), color=c, label=name, **_LINE)
 
     ax_land.set_xlabel("θ");  ax_land.set_ylabel("f(θ)")
-    ax_land.set_title("Loss Landscape + Final Position", fontweight="bold")
+    ax_land.axvline(0.5, color=COLORS["warn"], lw=1, ls="--", alpha=0.55, label="Basin boundary")
+    ax_land.set_title("Two True Minima + Final Positions", fontweight="bold")
     ax_land.legend(fontsize=7, framealpha=0.7)
     ax_loss.set_xlabel("Step");  ax_loss.set_ylabel("Loss (log)")
     ax_loss.set_title("Convergence Curves", fontweight="bold")
@@ -179,7 +200,7 @@ def plot_scenario_hyperparams(data: dict, fig: Figure) -> Figure:
         ax_theta.plot(d["thetas"], color=c, label=name, **_LINE)
 
     ax_loss.set_xlabel("Step");  ax_loss.set_ylabel("Loss (clipped at 50)")
-    ax_loss.set_title("Loss — Divergence Visible", fontweight="bold")
+    ax_loss.set_title("Loss — Slowdown and Oscillation", fontweight="bold")
     ax_loss.legend(fontsize=7, framealpha=0.7)
     ax_theta.axhline(0, color="#ffd700", lw=1, ls="--", alpha=0.6, label="Optimum")
     ax_theta.set_xlabel("Step");  ax_theta.set_ylabel("θ (clipped)")

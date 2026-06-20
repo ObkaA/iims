@@ -18,22 +18,22 @@ WHY ADAM SOMETIMES FAILS (see adam_failure_scenarios.py for live demos):
    magnitudes. If the loss landscape changes suddenly (e.g. curriculum
    learning, changing data distribution), v̂ is stale → wrong scale.
 
-2. SPARSE + INFREQUENT GRADIENTS with WRONG β₂: If a feature fires rarely,
-   its v accumulates near zero → huge effective step when it does fire.
-   High β₂ (0.999) amplifies this with long memory.
+2. SPARSE + INFREQUENT GRADIENTS: Per-coordinate normalization may keep a
+   rare coordinate's update close to α instead of letting it shrink in direct
+   proportion to the raw gradient. This can leave residual oscillation.
 
-3. SHARP MINIMA / GENERALIZATION GAP: Adam's adaptive step can overshoot
-   or settle into "wide" flat minima. SGD with momentum often finds
-   "sharp" minima that generalize better (Wilson et al., 2017).
+3. IMPLICIT OPTIMIZER BIAS: Adaptive methods and SGD can select different
+   basins. In some deep-learning experiments adaptive methods find sharper
+   solutions while momentum SGD reaches flatter ones; this is not universal.
 
 4. VERY SMALL DATASETS: With few samples, the stochastic noise in gradients
    is low. Adam's correction for variance becomes unnecessary overhead and
    can introduce oscillation around the optimum.
 
-5. POORLY TUNED β₁ ≥ 1 or α TOO LARGE: m̂ = m/(1-β₁ᵗ) blows up if
-   β₁ is set too high (≥ 0.999), causing divergence. Unlike SGD where
-   the learning rate directly bounds the step, Adam's effective step is
-   α/(√v̂ + ε) and can be large even with small α.
+5. POORLY TUNED β₁ OR α: β₁ close to 1 gives the signed-gradient estimate
+   very long memory, while a very large α causes oscillatory transients.
+   Bias correction is not itself a 1/(1-β₁) amplification of the first step:
+   the same factor is present in the initial moment update and cancels out.
 """
 import numpy as np
 from .base import BaseOptimizer

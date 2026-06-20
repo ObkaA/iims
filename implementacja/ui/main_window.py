@@ -1,6 +1,7 @@
 """Main application window — ConvexML v2."""
 from __future__ import annotations
 import sys, os
+import re
 import numpy as np
 from pathlib import Path
 
@@ -8,7 +9,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QComboBox, QSpinBox, QDoubleSpinBox,
     QGroupBox, QTabWidget, QFileDialog, QFrame, QGridLayout,
-    QSizePolicy, QScrollArea, QSplitter, QTextEdit,
+    QSizePolicy, QScrollArea, QSplitter, QTextEdit, QInputDialog, QMessageBox,
 )
 from PyQt6.QtCore import Qt, pyqtSlot, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
@@ -24,11 +25,13 @@ from algorithms.adam_failures import (
     scenario_sharp_vs_flat, scenario_bad_hyperparams,
 )
 from models import MODELS
-from data import DATASETS, load_csv
+from data import DATASETS, CSVDataError, inspect_csv, load_csv
+from metrics import binary_confusion_matrix
 from training_engine import TrainingWorker
 from visualization import (
     plot_loss_curves, plot_regression_fit, plot_decision_boundary,
-    plot_comparison, build_loss_surface, plot_loss_surface_3d, COLORS,
+    plot_comparison, plot_confusion_matrix, build_loss_surface,
+    plot_loss_surface_3d, COLORS,
 )
 from visualization.adam_failure_viz import SCENARIO_PLOTS
 from ui.rec_panel import MusicRecommendationPanel
@@ -119,6 +122,14 @@ QPushButton#btn_csv {
     border: 1px solid #30363d; font-size: 11px; padding: 4px 10px;
 }
 QPushButton#btn_csv:hover { border-color: #58a6ff; color: #58a6ff; }
+QPushButton#btn_generate {
+    background: #0d419d; color: #fff;
+    border: 1px solid #1f6feb; font-size: 11px; padding: 4px 10px;
+}
+QPushButton#btn_generate:hover { background: #1f6feb; }
+QPushButton#btn_generate:disabled {
+    background: #161b22; color: #484f58; border-color: #21262d;
+}
 QTabWidget::pane {
     border: 1px solid #21262d; border-radius: 6px; background: #0d1117;
 }
@@ -136,6 +147,23 @@ QLabel#stat_label {
     font-size: 9px; color: #7d8590; letter-spacing: 1px;
 }
 QScrollArea  { border: none; }
+QScrollBar:vertical {
+    background: #010409;
+    width: 9px;
+    margin: 2px 0;
+}
+QScrollBar::handle:vertical {
+    background: #30363d;
+    min-height: 28px;
+    border-radius: 4px;
+}
+QScrollBar::handle:vertical:hover { background: #58a6ff; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
+}
 QTextEdit {
     background: #0d1117; color: #c9d1d9;
     border: 1px solid #21262d; border-radius: 6px;
@@ -222,22 +250,22 @@ ALG_INFO = {
 
 SCENARIO_META = [
     {
-        "label": "1 · Sparse Gradients",
+        "label": "1 · Sparse Coordinate",
         "color": "#ff6b6b",
         "icon":  "⚡",
     },
     {
-        "label": "2 · Non-Stationary",
+        "label": "2 · Moving Optimum",
         "color": "#d29922",
         "icon":  "🔀",
     },
     {
-        "label": "3 · Sharp Minima",
+        "label": "3 · Sharp vs Flat",
         "color": "#a8ff78",
         "icon":  "⛰",
     },
     {
-        "label": "4 · Bad Hyperparams",
+        "label": "4 · Extreme Parameters",
         "color": "#f78166",
         "icon":  "💥",
     },
@@ -301,8 +329,15 @@ class MainWindow(QMainWindow):
 
     # ── Sidebar ────────────────────────────────────────────────────────────────
     def _build_sidebar(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setFixedWidth(300)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
         sb = QWidget()
-        sb.setFixedWidth(300)
+        sb.setMinimumWidth(280)
         sb.setStyleSheet("background:#010409;border-right:1px solid #21262d;")
         lay = QVBoxLayout(sb)
         lay.setContentsMargins(14, 18, 14, 14)
@@ -354,20 +389,41 @@ class MainWindow(QMainWindow):
         self.cb_model.currentIndexChanged.connect(self._on_model_changed)
         dl.addWidget(QLabel("Model:"))
         dl.addWidget(self.cb_model)
-        self.lbl_ridge_lambda = QLabel("Ridge regularization (λ):")
+        self.ridge_lambda_row = QWidget()
+        ridge_lambda_layout = QHBoxLayout(self.ridge_lambda_row)
+        ridge_lambda_layout.setContentsMargins(0, 0, 0, 0)
+        ridge_lambda_layout.setSpacing(8)
+        self.lbl_ridge_lambda = QLabel("Regularization λ")
         self.spin_ridge_lambda = QDoubleSpinBox()
         self.spin_ridge_lambda.setRange(0.0, 1000.0)
         self.spin_ridge_lambda.setValue(1.0)
         self.spin_ridge_lambda.setSingleStep(0.1)
         self.spin_ridge_lambda.setDecimals(4)
         self.spin_ridge_lambda.valueChanged.connect(self._on_model_changed)
-        dl.addWidget(self.lbl_ridge_lambda)
-        dl.addWidget(self.spin_ridge_lambda)
+        ridge_lambda_layout.addWidget(self.lbl_ridge_lambda)
+        ridge_lambda_layout.addWidget(self.spin_ridge_lambda, stretch=1)
+        dl.addWidget(self.ridge_lambda_row)
         self.cb_dataset = QComboBox()
         self.cb_dataset.addItems(list(DATASETS.keys()))
         self.cb_dataset.currentIndexChanged.connect(self._load_dataset)
         dl.addWidget(QLabel("Dataset:"))
         dl.addWidget(self.cb_dataset)
+        dataset_size_row = QWidget()
+        dataset_size_layout = QHBoxLayout(dataset_size_row)
+        dataset_size_layout.setContentsMargins(0, 0, 0, 0)
+        dataset_size_layout.setSpacing(8)
+        dataset_size_layout.addWidget(QLabel("Samples"))
+        self.spin_dataset_size = QSpinBox()
+        self.spin_dataset_size.setRange(20, 100000)
+        self.spin_dataset_size.setValue(200)
+        self.spin_dataset_size.setSingleStep(100)
+        self.spin_dataset_size.setGroupSeparatorShown(True)
+        dataset_size_layout.addWidget(self.spin_dataset_size, stretch=1)
+        dl.addWidget(dataset_size_row)
+        self.btn_generate_dataset = QPushButton("↻  Generate dataset")
+        self.btn_generate_dataset.setObjectName("btn_generate")
+        self.btn_generate_dataset.clicked.connect(self._load_dataset)
+        dl.addWidget(self.btn_generate_dataset)
         btn_csv = QPushButton("⬆  Load CSV")
         btn_csv.setObjectName("btn_csv")
         btn_csv.clicked.connect(self._load_csv)
@@ -434,7 +490,9 @@ class MainWindow(QMainWindow):
         ver.setStyleSheet("font-size:8px;color:#3d444d;")
         ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(ver)
-        return sb
+        sb.setMinimumHeight(sb.sizeHint().height())
+        scroll.setWidget(sb)
+        return scroll
 
     # ── Main content (optimization tab) ───────────────────────────────────────
     def _build_content(self) -> QWidget:
@@ -479,6 +537,8 @@ class MainWindow(QMainWindow):
             "font-size:10px;color:#7d8590;padding:4px 8px;"
             "border-top:1px solid #21262d;background:#010409;"
         )
+        self.status_label.setWordWrap(True)
+        self.status_label.setMinimumHeight(34)
         lay.addWidget(self.status_label)
         return w
 
@@ -556,7 +616,7 @@ class MainWindow(QMainWindow):
         exp_l = QVBoxLayout(exp_w)
         exp_l.setContentsMargins(14, 10, 14, 10)
 
-        exp_hdr = QLabel("WHY ADAM FAILS HERE")
+        exp_hdr = QLabel("WHAT THIS EXPERIMENT SHOWS")
         exp_hdr.setStyleSheet(
             "font-size:10px;font-weight:bold;color:#f78166;letter-spacing:2px;"
         )
@@ -564,15 +624,16 @@ class MainWindow(QMainWindow):
 
         self.txt_explanation = QTextEdit()
         self.txt_explanation.setReadOnly(True)
-        self.txt_explanation.setMaximumHeight(130)
+        self.txt_explanation.setMaximumHeight(220)
         self.txt_explanation.setPlainText(
             "Select a scenario from the left panel to see the explanation.\n\n"
-            "Each scenario shows a concrete case where Adam's adaptive moment\n"
-            "estimation causes suboptimal behaviour compared to simpler methods."
+            "Each scenario isolates one behavior of Adam and compares the actual\n"
+            "trajectory with simpler optimizers. Read the plot and explanation\n"
+            "together: not every scenario implies divergence."
         )
         exp_l.addWidget(self.txt_explanation)
         splitter.addWidget(exp_w)
-        splitter.setSizes([550, 160])
+        splitter.setSizes([500, 230])
 
         rl.addWidget(splitter)
         lay.addWidget(right, stretch=1)
@@ -637,33 +698,98 @@ class MainWindow(QMainWindow):
             self.spin_lr.setValue(0.01)
             self.spin_iter.setValue(300)
 
-    def _load_dataset(self):
+    def _load_dataset(self, _=None):
         name = self.cb_dataset.currentText()
         if name not in DATASETS:
             return
-        self._X, self._y = DATASETS[name]()
+        self.spin_dataset_size.setEnabled(True)
+        self.btn_generate_dataset.setEnabled(True)
+        requested_size = self.spin_dataset_size.value()
+        self._X, self._y = DATASETS[name](n_samples=requested_size)
         self._on_model_changed()
         self._reset()
+        self.status_label.setText(
+            f"Generated {name}: {len(self._y):,} samples × {self._X.shape[1]} features"
+        )
 
     def _load_csv(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open CSV", "", "CSV files (*.csv)"
+            self,
+            "Open dataset",
+            "",
+            "Data files (*.csv *.tsv *.txt);;All files (*)",
         )
-        if path:
-            try:
-                self._X, self._y = load_csv(path)
-                self.status_label.setText(
-                    f"Loaded: {Path(path).name}  ({len(self._y)} rows)"
+        if not path:
+            return
+
+        try:
+            inspection = inspect_csv(path)
+            default_index = inspection.columns.index(inspection.suggested_target)
+            target_column, accepted = QInputDialog.getItem(
+                self,
+                "Select target column",
+                "Which column should the model predict?",
+                inspection.columns,
+                default_index,
+                False,
+            )
+            if not accepted:
+                return
+
+            model = self._create_model()
+            X, y, info = load_csv(
+                path,
+                target_column=target_column,
+                task=model.task,
+                return_info=True,
+            )
+
+            self._X, self._y = X, y
+            dataset_name = f"CSV: {Path(path).name}"
+            self.cb_dataset.blockSignals(True)
+            for index in range(self.cb_dataset.count() - 1, -1, -1):
+                if self.cb_dataset.itemText(index).startswith("CSV: "):
+                    self.cb_dataset.removeItem(index)
+            self.cb_dataset.addItem(dataset_name)
+            self.cb_dataset.setCurrentText(dataset_name)
+            self.cb_dataset.blockSignals(False)
+            self.spin_dataset_size.setEnabled(False)
+            self.btn_generate_dataset.setEnabled(False)
+
+            self._on_model_changed()
+            self._reset()
+            notes = []
+            if info.rows_dropped:
+                notes.append(f"dropped {info.rows_dropped} rows without target")
+            if info.imputed_values:
+                notes.append(f"imputed {info.imputed_values} missing values")
+            if info.categorical_columns:
+                notes.append(f"encoded {len(info.categorical_columns)} categorical columns")
+            if info.class_mapping:
+                mapping = ", ".join(
+                    f"{label}→{int(value)}" for label, value in info.class_mapping.items()
                 )
-                self._reset()
-            except Exception as e:
-                self.status_label.setText(f"Error loading CSV: {e}")
+                notes.append(f"classes: {mapping}")
+            suffix = f"; {'; '.join(notes)}" if notes else ""
+            self.status_label.setText(
+                f"Loaded {Path(path).name}: {X.shape[0]} rows × {X.shape[1]} features; "
+                f"target: {info.target_name}{suffix}"
+            )
+        except CSVDataError as exc:
+            self.status_label.setText(f"CSV error: {exc}")
+            QMessageBox.warning(self, "Cannot load dataset", str(exc))
+        except Exception as exc:
+            self.status_label.setText(f"Unexpected CSV error: {exc}")
+            QMessageBox.critical(
+                self,
+                "Unexpected CSV error",
+                f"The file could not be prepared:\n{exc}",
+            )
 
     def _on_model_changed(self):
         model_name = self.cb_model.currentText()
         is_ridge = model_name == "Ridge Regression"
-        self.lbl_ridge_lambda.setEnabled(is_ridge)
-        self.spin_ridge_lambda.setEnabled(is_ridge)
+        self.ridge_lambda_row.setVisible(is_ridge)
         self._current_model = self._create_model()
         if self._X is not None and self._y is not None:
             self._current_model.fit_data(self._X, self._y)
@@ -759,14 +885,55 @@ class MainWindow(QMainWindow):
             "iterations": payload["iteration"],
             "accuracy":   payload.get("accuracy"),
         }
+        try:
+            saved_path = self._save_confusion_matrix(name)
+            saved_message = f"  |  PNG: {saved_path.name}" if saved_path else ""
+        except Exception as exc:
+            saved_message = f"  |  PNG save failed: {exc}"
         self.status_label.setText(
             f"✔ {name}  loss={payload['loss']:.5f}"
             f"  iters={payload['iteration']}  t={payload['elapsed']:.2f}s"
+            f"{saved_message}"
         )
         if len(self._stats) >= len(self._workers):
             self.btn_start.setEnabled(True)
             self.btn_pause.setEnabled(False)
             self._refresh_all_tabs()
+
+    def _save_confusion_matrix(self, optimizer_name: str) -> Path | None:
+        worker = next(
+            (item for item in self._workers if item.optimizer.name == optimizer_name),
+            None,
+        )
+        if worker is None or worker.model.task != "classification":
+            return None
+
+        predicted = worker.model.predict_class(self._X)
+        matrix = binary_confusion_matrix(self._y, predicted)
+        dataset_name = self.cb_dataset.currentText().removeprefix("CSV: ")
+
+        def safe_name(value: str) -> str:
+            cleaned = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+            return cleaned or "dataset"
+
+        output_dir = Path(__file__).resolve().parents[2] / "wyniki"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / (
+            f"confusion_matrix_{safe_name(dataset_name)}_"
+            f"{safe_name(optimizer_name)}.png"
+        )
+        figure = plot_confusion_matrix(
+            matrix,
+            title=f"{dataset_name} — {optimizer_name}",
+        )
+        figure.savefig(
+            output_path,
+            dpi=180,
+            bbox_inches="tight",
+            facecolor=figure.get_facecolor(),
+        )
+        figure.clear()
+        return output_path
 
     def _refresh_all_tabs(self):
         self._update_loss_tab()

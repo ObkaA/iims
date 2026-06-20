@@ -354,6 +354,15 @@ class MainWindow(QMainWindow):
         self.cb_model.currentIndexChanged.connect(self._on_model_changed)
         dl.addWidget(QLabel("Model:"))
         dl.addWidget(self.cb_model)
+        self.lbl_ridge_lambda = QLabel("Ridge regularization (λ):")
+        self.spin_ridge_lambda = QDoubleSpinBox()
+        self.spin_ridge_lambda.setRange(0.0, 1000.0)
+        self.spin_ridge_lambda.setValue(1.0)
+        self.spin_ridge_lambda.setSingleStep(0.1)
+        self.spin_ridge_lambda.setDecimals(4)
+        self.spin_ridge_lambda.valueChanged.connect(self._on_model_changed)
+        dl.addWidget(self.lbl_ridge_lambda)
+        dl.addWidget(self.spin_ridge_lambda)
         self.cb_dataset = QComboBox()
         self.cb_dataset.addItems(list(DATASETS.keys()))
         self.cb_dataset.currentIndexChanged.connect(self._load_dataset)
@@ -652,7 +661,10 @@ class MainWindow(QMainWindow):
 
     def _on_model_changed(self):
         model_name = self.cb_model.currentText()
-        self._current_model = MODELS[model_name]()
+        is_ridge = model_name == "Ridge Regression"
+        self.lbl_ridge_lambda.setEnabled(is_ridge)
+        self.spin_ridge_lambda.setEnabled(is_ridge)
+        self._current_model = self._create_model()
         if self._X is not None and self._y is not None:
             self._current_model.fit_data(self._X, self._y)
         is_cls = self._current_model.task == "classification"
@@ -660,6 +672,13 @@ class MainWindow(QMainWindow):
             f"font-size:20px;font-weight:bold;"
             f"color:{'#3fb950' if is_cls else '#3d444d'};"
         )
+
+    def _create_model(self):
+        model_name = self.cb_model.currentText()
+        model_class = MODELS[model_name]
+        if model_name == "Ridge Regression":
+            return model_class(regularization=self.spin_ridge_lambda.value())
+        return model_class()
 
     def _start(self):
         if self._X is None:
@@ -689,7 +708,7 @@ class MainWindow(QMainWindow):
             self.btn_pause.setEnabled(True)
 
     def _launch_worker(self, alg_name: str):
-        model = MODELS[self.cb_model.currentText()]()
+        model = self._create_model()
         model.fit_data(self._X, self._y)
 
         lr  = self.spin_lr.value()

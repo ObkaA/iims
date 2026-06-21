@@ -4,6 +4,8 @@ import time
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from metrics import regression_scores
+
 
 class TrainingWorker(QThread):
     """Runs one optimiser × model combination and emits progress signals."""
@@ -12,13 +14,15 @@ class TrainingWorker(QThread):
     finished  = pyqtSignal(dict)
     error     = pyqtSignal(str)
 
-    def __init__(self, model, optimizer, X, y,
+    def __init__(self, model, optimizer, X, y, X_eval=None, y_eval=None,
                  n_iterations=200, batch_size=32, emit_every=1):
         super().__init__()
         self.model        = model
         self.optimizer    = optimizer
         self.X            = X
         self.y            = y
+        self.X_eval       = X if X_eval is None else X_eval
+        self.y_eval       = y if y_eval is None else y_eval
         self.n_iterations = n_iterations
         self.batch_size   = batch_size
         self.emit_every   = emit_every
@@ -86,5 +90,8 @@ class TrainingWorker(QThread):
             "optimizer": self.optimizer.name,
         }
         if hasattr(self.model, "accuracy"):
-            p["accuracy"] = self.model.accuracy(self.X, self.y)
+            p["accuracy"] = self.model.accuracy(self.X_eval, self.y_eval)
+        elif self.model.task == "regression":
+            predictions = self.model.predict(self.X_eval)
+            p["r2"], p["rmse"] = regression_scores(self.y_eval, predictions)
         return p

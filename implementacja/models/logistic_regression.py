@@ -55,22 +55,6 @@ class LogisticRegressionModel(BaseModel):
     def accuracy(self, X: np.ndarray, y: np.ndarray) -> float:
         return float(np.mean(self.predict_class(X) == y))
 
-    def hessian(self, params: np.ndarray, X: np.ndarray, y: np.ndarray) -> np.ndarray:
-        """Hessian of BCE loss: H = (1/m) X_aug^T diag(p*(1-p)) X_aug"""
-        m = len(y)
-        p = self._forward(params, X)
-        X_aug = np.c_[np.ones(m), X]
-        weights = p * (1 - p)  # (m,)
-        return (1 / m) * (X_aug.T * weights) @ X_aug  # (k+1, k+1)
-
-    def loss_gradient_hessian(self, params: np.ndarray, X: np.ndarray, y: np.ndarray):
-        """Returns (loss, gradient, hessian) — used by Newton Method."""
-        return (
-            self.loss(params, X, y),
-            self.gradient(params, X, y),
-            self.hessian(params, X, y),
-        )
-
     @property
     def name(self) -> str:
         return "Logistic Regression"

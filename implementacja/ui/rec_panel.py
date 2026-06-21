@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
     QComboBox, QSpinBox, QDoubleSpinBox, QGroupBox, QTabWidget,
     QFileDialog, QListWidget, QListWidgetItem, QGridLayout,
-    QFrame, QSizePolicy, QProgressBar, QSplitter, QSlider,
+    QFrame, QSizePolicy, QProgressBar, QSplitter, QSlider, QScrollArea,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QTimer
 from PyQt6.QtGui import QColor
@@ -135,18 +135,30 @@ class MusicRecommendationPanel(QWidget):
         root.addWidget(splitter, stretch=1)
 
     def _build_sidebar(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setFixedWidth(340)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet(
+            "QScrollArea{background:#010409;border:none;"
+            "border-right:1px solid #21262d;}"
+        )
+
         w = QWidget()
-        w.setFixedWidth(285)
+        w.setMinimumWidth(315)
         w.setStyleSheet("background:#010409;border-right:1px solid #21262d;")
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(14, 16, 14, 12)
-        lay.setSpacing(10)
+        lay.setContentsMargins(16, 16, 16, 14)
+        lay.setSpacing(12)
 
         # Header
         logo = QLabel("♫  Music Recommender")
         logo.setStyleSheet("font-size:14px;font-weight:bold;color:#58a6ff;letter-spacing:1px;")
         sub  = QLabel("Matrix Factorization · ALS · from scratch")
         sub.setStyleSheet("font-size:9px;color:#7d8590;")
+        sub.setWordWrap(True)
         lay.addWidget(logo); lay.addWidget(sub)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
@@ -167,31 +179,43 @@ class MusicRecommendationPanel(QWidget):
 
         # Hyperparameters
         grp_hp = QGroupBox("ALS Hyperparameters")
-        hl = QGridLayout(grp_hp); hl.setSpacing(6)
+        hl = QGridLayout(grp_hp)
+        hl.setContentsMargins(12, 18, 12, 12)
+        hl.setHorizontalSpacing(12)
+        hl.setVerticalSpacing(8)
+        hl.setColumnMinimumWidth(0, 130)
+        hl.setColumnMinimumWidth(1, 120)
+        hl.setColumnStretch(1, 1)
 
         hl.addWidget(QLabel("Latent factors k"), 0, 0)
         self.spin_k = QSpinBox(); self.spin_k.setRange(2, 100); self.spin_k.setValue(15)
+        self.spin_k.setMinimumWidth(120)
         hl.addWidget(self.spin_k, 0, 1)
 
         hl.addWidget(QLabel("Regularization λ"), 1, 0)
         self.spin_reg = QDoubleSpinBox()
         self.spin_reg.setRange(0.001, 10.0); self.spin_reg.setValue(0.1)
         self.spin_reg.setSingleStep(0.05); self.spin_reg.setDecimals(3)
+        self.spin_reg.setMinimumWidth(120)
         hl.addWidget(self.spin_reg, 1, 1)
 
         hl.addWidget(QLabel("ALS Epochs"), 2, 0)
         self.spin_epochs = QSpinBox(); self.spin_epochs.setRange(5, 500); self.spin_epochs.setValue(30)
+        self.spin_epochs.setMinimumWidth(120)
         hl.addWidget(self.spin_epochs, 2, 1)
 
         hl.addWidget(QLabel("Embedding"), 3, 0)
         self.cb_embed = QComboBox(); self.cb_embed.addItems(["PCA", "t-SNE"])
+        self.cb_embed.setMinimumWidth(120)
         hl.addWidget(self.cb_embed, 3, 1)
 
         lay.addWidget(grp_hp)
 
         # Train controls
         grp_ctrl = QGroupBox("Model Training")
-        cl = QVBoxLayout(grp_ctrl); cl.setSpacing(6)
+        cl = QVBoxLayout(grp_ctrl)
+        cl.setContentsMargins(12, 18, 12, 12)
+        cl.setSpacing(8)
         self.btn_train = QPushButton("▶  Train ALS Model")
         self.btn_train.setObjectName("btn_start")
         self.btn_train.clicked.connect(self._train)
@@ -203,9 +227,10 @@ class MusicRecommendationPanel(QWidget):
         cl.addWidget(self.btn_stop)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100); self.progress_bar.setValue(0)
+        self.progress_bar.setMinimumHeight(22)
         self.progress_bar.setStyleSheet(
             "QProgressBar{background:#161b22;border:1px solid #30363d;"
-            "border-radius:4px;height:8px;text-align:center;}"
+            "border-radius:4px;min-height:20px;text-align:center;padding:0;}"
             "QProgressBar::chunk{background:#1f6feb;border-radius:3px;}"
         )
         cl.addWidget(self.progress_bar)
@@ -222,6 +247,7 @@ class MusicRecommendationPanel(QWidget):
 
         hint = QLabel("Pick from catalogue, then click Recommend:")
         hint.setStyleSheet("font-size:10px;color:#7d8590;")
+        hint.setWordWrap(True)
         yl.addWidget(hint)
 
         row1 = QHBoxLayout()
@@ -239,7 +265,8 @@ class MusicRecommendationPanel(QWidget):
         yl.addLayout(row1)
 
         self.lst_favourites = QListWidget()
-        self.lst_favourites.setMaximumHeight(110)
+        self.lst_favourites.setMinimumHeight(90)
+        self.lst_favourites.setMaximumHeight(130)
         self.lst_favourites.setStyleSheet(
             "QListWidget{background:#0d1117;border:1px solid #30363d;"
             "border-radius:5px;color:#e6edf3;font-size:11px;}"
@@ -256,6 +283,7 @@ class MusicRecommendationPanel(QWidget):
             "QPushButton:hover{background:#2d0e0e;}"
         )
         btn_rem.clicked.connect(self._remove_favourite)
+        btn_rem.setMinimumWidth(105)
         btn_clr = QPushButton("↺ Clear")
         btn_clr.setStyleSheet(
             "QPushButton{background:#161b22;border:1px solid #30363d;"
@@ -263,7 +291,8 @@ class MusicRecommendationPanel(QWidget):
             "QPushButton:hover{border-color:#7d8590;color:#e6edf3;}"
         )
         btn_clr.clicked.connect(self._clear_favourites)
-        btn_row.addWidget(btn_rem); btn_row.addWidget(btn_clr)
+        btn_clr.setMinimumWidth(95)
+        btn_row.addWidget(btn_rem, stretch=1); btn_row.addWidget(btn_clr, stretch=1)
         yl.addLayout(btn_row)
 
         self.lbl_picks = QLabel("0 / 5 selected")
@@ -277,6 +306,8 @@ class MusicRecommendationPanel(QWidget):
         row_n = QHBoxLayout()
         row_n.addWidget(QLabel("Top-N:"))
         self.spin_topn = QSpinBox(); self.spin_topn.setRange(3, 20); self.spin_topn.setValue(8)
+        self.spin_topn.setMinimumWidth(120)
+        row_n.addStretch()
         row_n.addWidget(self.spin_topn)
         rl.addLayout(row_n)
         self.btn_recommend = QPushButton("🎵  Recommend For Me")
@@ -309,8 +340,11 @@ class MusicRecommendationPanel(QWidget):
         self.status_lbl = QLabel("Load data → Train → Pick artists → Recommend.")
         self.status_lbl.setStyleSheet("font-size:10px;color:#7d8590;")
         self.status_lbl.setWordWrap(True)
+        self.status_lbl.setMinimumHeight(42)
         lay.addWidget(self.status_lbl)
-        return w
+        w.setMinimumHeight(w.sizeHint().height())
+        scroll.setWidget(w)
+        return scroll
 
     def _build_stats_row(self) -> QWidget:
         w = QWidget(); w.setMaximumHeight(86)
@@ -464,7 +498,8 @@ class MusicRecommendationPanel(QWidget):
     # ALS Training
     # ══════════════════════════════════════════════════════════════════════════
     def _train(self):
-        self._stop()
+        if not self._stop():
+            return
         self._you_vec = None
         self._mf = MatrixFactorization(
             n_factors  = self.spin_k.value(),
@@ -476,7 +511,7 @@ class MusicRecommendationPanel(QWidget):
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_training_done)
-        self._worker.error.connect(lambda e: self.status_lbl.setText(f"Error: {e}"))
+        self._worker.error.connect(self._on_training_error)
         self._worker.start()
         self.btn_train.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -510,11 +545,24 @@ class MusicRecommendationPanel(QWidget):
         self.sld_epoch.setValue(0)
         self._refresh_all_charts()
 
-    def _stop(self):
-        if self._worker and self._worker.isRunning():
-            self._worker.stop(); self._worker.wait(1000)
+    @pyqtSlot(str)
+    def _on_training_error(self, message: str):
         self.btn_train.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self.btn_recommend.setEnabled(False)
+        self.status_lbl.setText(f"ALS training failed: {message}")
+
+    def _stop(self, timeout_ms: int = 5000) -> bool:
+        if self._worker and self._worker.isRunning():
+            self._worker.stop()
+            if not self._worker.wait(timeout_ms) and self._worker.isRunning():
+                self.btn_train.setEnabled(False)
+                self.btn_stop.setEnabled(True)
+                self.status_lbl.setText("ALS worker is still stopping. Please wait.")
+                return False
+        self.btn_train.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        return True
 
     # ══════════════════════════════════════════════════════════════════════════
     # Personalised recommendations via fold-in ALS
@@ -608,8 +656,8 @@ class MusicRecommendationPanel(QWidget):
                 fig=self.fig_embed,
             )
             self.canvas_embed.draw_idle()
-        except Exception:
-            pass
+        except Exception as exc:
+            self.status_lbl.setText(f"Embedding unavailable: {exc}")
 
     # Animation
     def _on_epoch_slide(self, val: int):
@@ -637,4 +685,8 @@ class MusicRecommendationPanel(QWidget):
         self._show_anim_frame(self._anim_idx)
 
     def closeEvent(self, event):
-        self._anim_timer.stop(); self._stop(); super().closeEvent(event)
+        self._anim_timer.stop()
+        if not self._stop(timeout_ms=5000):
+            event.ignore()
+            return
+        super().closeEvent(event)

@@ -88,6 +88,71 @@ DATASETS = {
     "Circles":           generate_circles,
 }
 
+DATASET_TASKS = {
+    "Linear Data": "regression",
+    "Noisy Linear Data": "regression",
+    "Logistic 2D": "classification",
+    "Circles": "classification",
+}
+
+
+def train_test_split(
+    X: np.ndarray,
+    y: np.ndarray,
+    test_fraction: float = 0.2,
+    task: str = "regression",
+    seed: int = 42,
+):
+    """Deterministically split data; preserve class proportions for classification."""
+    X = np.asarray(X)
+    y = np.asarray(y).reshape(-1)
+    if X.ndim != 2 or len(X) != len(y):
+        raise ValueError("X must be 2-D and contain the same number of rows as y.")
+    if len(y) < 4:
+        raise ValueError("At least 4 samples are required for a train/test split.")
+    if not 0.05 <= test_fraction <= 0.5:
+        raise ValueError("Test fraction must be between 5% and 50%.")
+
+    rng = np.random.default_rng(seed)
+    if task == "classification":
+        test_parts = []
+        train_parts = []
+        for label in np.unique(y):
+            indices = np.flatnonzero(y == label)
+            if len(indices) < 2:
+                raise ValueError(f"Class {label!r} needs at least 2 samples for splitting.")
+            indices = rng.permutation(indices)
+            n_test = min(len(indices) - 1, max(1, round(len(indices) * test_fraction)))
+            test_parts.append(indices[:n_test])
+            train_parts.append(indices[n_test:])
+        test_indices = rng.permutation(np.concatenate(test_parts))
+        train_indices = rng.permutation(np.concatenate(train_parts))
+    elif task == "regression":
+        indices = rng.permutation(len(y))
+        n_test = min(len(y) - 1, max(1, round(len(y) * test_fraction)))
+        test_indices = indices[:n_test]
+        train_indices = indices[n_test:]
+    else:
+        raise ValueError("Task must be 'regression' or 'classification'.")
+
+    return X[train_indices], X[test_indices], y[train_indices], y[test_indices]
+
+
+def standardize_from_training(
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    X_full: np.ndarray,
+):
+    """Standardize all feature sets using statistics calculated only on training data."""
+    mean = np.mean(X_train, axis=0)
+    scale = np.std(X_train, axis=0)
+    scale = np.where(scale < 1e-12, 1.0, scale)
+    return (
+        (X_train - mean) / scale,
+        (X_test - mean) / scale,
+        (X_full - mean) / scale,
+    )
+
 
 MISSING_VALUES = {"", "?", "na", "n/a", "nan", "null", "none", "missing"}
 TARGET_NAMES = {"target", "y", "label", "class", "output", "result", "wartosc_docelowa"}

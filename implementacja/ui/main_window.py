@@ -25,7 +25,10 @@ from algorithms.adam_failures import (
     scenario_sharp_vs_flat, scenario_bad_hyperparams,
 )
 from models import MODELS
-from data import DATASETS, CSVDataError, inspect_csv, load_csv
+from data import (
+    DATASETS, DATASET_TASKS, CSVDataError, inspect_csv, load_csv,
+    standardize_from_training, train_test_split,
+)
 from metrics import binary_confusion_matrix
 from training_engine import TrainingWorker
 from visualization import (
@@ -35,6 +38,11 @@ from visualization import (
 )
 from visualization.adam_failure_viz import SCENARIO_PLOTS
 from ui.rec_panel import MusicRecommendationPanel
+
+OPTIMIZATION_ALGORITHMS = {
+    name: optimizer for name, optimizer in ALGORITHMS.items() if name != "ALS"
+}
+COMPARE_PLACEHOLDER = "— Compare with —"
 
 # ── Stylesheet ─────────────────────────────────────────────────────────────────
 SS = """
@@ -191,11 +199,11 @@ class StatCard(QWidget):
         self.val = QLabel("—")
         self.val.setObjectName("stat_value")
         self.val.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl = QLabel(label.upper())
-        lbl.setObjectName("stat_label")
-        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl = QLabel(label.upper())
+        self.lbl.setObjectName("stat_label")
+        self.lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         fl.addWidget(self.val)
-        fl.addWidget(lbl)
+        fl.addWidget(self.lbl)
         lay.addWidget(frame)
 
     def set_value(self, v):
@@ -203,6 +211,10 @@ class StatCard(QWidget):
             self.val.setText(f"{v:.4f}{self.unit}")
         else:
             self.val.setText(f"{v}{self.unit}")
+
+    def set_metric(self, label: str, unit: str = ""):
+        self.lbl.setText(label.upper())
+        self.unit = unit
 
 
 class MplCanvas(FigureCanvas):
@@ -283,6 +295,12 @@ class MainWindow(QMainWindow):
         self._stats:     dict = {}
         self._surface_trajectories: dict = {}
         self._X = self._y = None
+        self._X_model = self._X_train = self._X_test = None
+        self._y_train = self._y_test = None
+        self._csv_dataset_name: str | None = None
+        self._csv_task: str | None = None
+        self._csv_X = self._csv_y = None
+        self._finished_workers = 0
         self._current_model = None
         self._scenario_workers: dict[int, ScenarioWorker] = {}
         self._scenario_data:    dict[int, dict] = {}
@@ -362,13 +380,13 @@ class MainWindow(QMainWindow):
         grp_alg = QGroupBox("Algorithm")
         al = QVBoxLayout(grp_alg)
         self.cb_algorithm = QComboBox()
-        self.cb_algorithm.addItems(list(ALGORITHMS.keys()))
+        self.cb_algorithm.addItems(list(OPTIMIZATION_ALGORITHMS.keys()))
         self.cb_algorithm.currentIndexChanged.connect(self._on_alg_changed)
         al.addWidget(self.cb_algorithm)
 
         self.cb_compare = QComboBox()
-        self.cb_compare.addItem("— Compare with —")
-        self.cb_compare.addItems(list(ALGORITHMS.keys()))
+        self.cb_compare.addItem(COMPARE_PLACEHOLDER)
+        self.cb_compare.addItems(list(OPTIMIZATION_ALGORITHMS.keys()))
         al.addWidget(self.cb_compare)
 
         self.lbl_alg_info = QLabel()
@@ -404,7 +422,9 @@ class MainWindow(QMainWindow):
         ridge_lambda_layout.addWidget(self.spin_ridge_lambda, stretch=1)
         dl.addWidget(self.ridge_lambda_row)
         self.cb_dataset = QComboBox()
-        self.cb_dataset.addItems(list(DATASETS.keys()))
+        self.cb_dataset.addItems([
+            name for name in DATASETS if DATASET_TASKS[name] == "regression"
+        ])
         self.cb_dataset.currentIndexChanged.connect(self._load_dataset)
         dl.addWidget(QLabel("Dataset:"))
         dl.addWidget(self.cb_dataset)
@@ -424,10 +444,10 @@ class MainWindow(QMainWindow):
         self.btn_generate_dataset.setObjectName("btn_generate")
         self.btn_generate_dataset.clicked.connect(self._load_dataset)
         dl.addWidget(self.btn_generate_dataset)
-        btn_csv = QPushButton("⬆  Load CSV")
-        btn_csv.setObjectName("btn_csv")
-        btn_csv.clicked.connect(self._load_csv)
-        dl.addWidget(btn_csv)
+        self.btn_csv = QPushButton("⬆  Load CSV")
+        self.btn_csv.setObjectName("btn_csv")
+        self.btn_csv.clicked.connect(self._load_csv)
+        dl.addWidget(self.btn_csv)
         lay.addWidget(grp_data)
 
         # Hyperparameters
@@ -463,6 +483,13 @@ class MainWindow(QMainWindow):
         self.spin_emit.setRange(1, 50)
         self.spin_emit.setValue(2)
         hl.addWidget(self.spin_emit, 3, 1)
+
+        hl.addWidget(QLabel("Test split %"), 4, 0)
+        self.spin_test_split = QSpinBox()
+        self.spin_test_split.setRange(10, 50)
+        self.spin_test_split.setValue(20)
+        self.spin_test_split.setSuffix(" %")
+        hl.addWidget(self.spin_test_split, 4, 1)
 
         lay.addWidget(grp_hp)
 
@@ -683,6 +710,17 @@ class MainWindow(QMainWindow):
     def _on_alg_changed(self, _=None):
         name = self.cb_algorithm.currentText()
         self.lbl_alg_info.setText(ALG_INFO.get(name, ""))
+        previous_compare = self.cb_compare.currentText()
+        compare_options = [
+            candidate for candidate in OPTIMIZATION_ALGORITHMS if candidate != name
+        ]
+        self.cb_compare.blockSignals(True)
+        self.cb_compare.clear()
+        self.cb_compare.addItem(COMPARE_PLACEHOLDER)
+        self.cb_compare.addItems(compare_options)
+        if previous_compare in compare_options:
+            self.cb_compare.setCurrentText(previous_compare)
+        self.cb_compare.blockSignals(False)
         # Sensible defaults per algorithm
         if name == "Newton Method":
             self.spin_iter.setValue(30)
@@ -698,14 +736,47 @@ class MainWindow(QMainWindow):
             self.spin_lr.setValue(0.01)
             self.spin_iter.setValue(300)
 
+    def _refresh_dataset_choices(self, task: str, preferred: str | None = None) -> bool:
+        previous = self.cb_dataset.currentText()
+        options = [name for name in DATASETS if DATASET_TASKS[name] == task]
+        if self._csv_dataset_name and self._csv_task == task:
+            options.append(self._csv_dataset_name)
+        selected = preferred or previous
+        if selected not in options:
+            selected = options[0]
+        self.cb_dataset.blockSignals(True)
+        self.cb_dataset.clear()
+        self.cb_dataset.addItems(options)
+        self.cb_dataset.setCurrentText(selected)
+        self.cb_dataset.blockSignals(False)
+        return selected != previous
+
     def _load_dataset(self, _=None):
         name = self.cb_dataset.currentText()
+        if name == self._csv_dataset_name and self._csv_X is not None:
+            self._X, self._y = self._csv_X.copy(), self._csv_y.copy()
+            self._X_model = self._X_train = self._X_test = None
+            self._y_train = self._y_test = None
+            self.spin_dataset_size.setEnabled(False)
+            self.btn_generate_dataset.setEnabled(False)
+            self._on_model_changed()
+            self._reset()
+            self.status_label.setText(
+                f"Restored {name}: {len(self._y):,} samples × {self._X.shape[1]} features"
+            )
+            return
         if name not in DATASETS:
             return
+        model_task = self._create_model().task
+        if DATASET_TASKS[name] != model_task:
+            self._refresh_dataset_choices(model_task)
+            name = self.cb_dataset.currentText()
         self.spin_dataset_size.setEnabled(True)
         self.btn_generate_dataset.setEnabled(True)
         requested_size = self.spin_dataset_size.value()
         self._X, self._y = DATASETS[name](n_samples=requested_size)
+        self._X_model = self._X_train = self._X_test = None
+        self._y_train = self._y_test = None
         self._on_model_changed()
         self._reset()
         self.status_label.setText(
@@ -741,18 +812,18 @@ class MainWindow(QMainWindow):
                 path,
                 target_column=target_column,
                 task=model.task,
+                standardize=False,
                 return_info=True,
             )
 
             self._X, self._y = X, y
             dataset_name = f"CSV: {Path(path).name}"
-            self.cb_dataset.blockSignals(True)
-            for index in range(self.cb_dataset.count() - 1, -1, -1):
-                if self.cb_dataset.itemText(index).startswith("CSV: "):
-                    self.cb_dataset.removeItem(index)
-            self.cb_dataset.addItem(dataset_name)
-            self.cb_dataset.setCurrentText(dataset_name)
-            self.cb_dataset.blockSignals(False)
+            self._X_model = self._X_train = self._X_test = None
+            self._y_train = self._y_test = None
+            self._csv_dataset_name = dataset_name
+            self._csv_task = model.task
+            self._csv_X, self._csv_y = X.copy(), y.copy()
+            self._refresh_dataset_choices(model.task, preferred=dataset_name)
             self.spin_dataset_size.setEnabled(False)
             self.btn_generate_dataset.setEnabled(False)
 
@@ -791,12 +862,17 @@ class MainWindow(QMainWindow):
         is_ridge = model_name == "Ridge Regression"
         self.ridge_lambda_row.setVisible(is_ridge)
         self._current_model = self._create_model()
+        dataset_changed = self._refresh_dataset_choices(self._current_model.task)
+        if dataset_changed and self.cb_dataset.currentText() in DATASETS:
+            self._load_dataset()
+            return
         if self._X is not None and self._y is not None:
             self._current_model.fit_data(self._X, self._y)
         is_cls = self._current_model.task == "classification"
+        self.stat_acc.set_metric("Test Accuracy" if is_cls else "Test R²", "%")
         self.stat_acc.val.setStyleSheet(
             f"font-size:20px;font-weight:bold;"
-            f"color:{'#3fb950' if is_cls else '#3d444d'};"
+            f"color:{'#3fb950' if is_cls else '#58a6ff'};"
         )
 
     def _create_model(self):
@@ -809,14 +885,34 @@ class MainWindow(QMainWindow):
     def _start(self):
         if self._X is None:
             self._load_dataset()
-        self._reset_workers()
+        if not self._reset_workers():
+            self.status_label.setText("Previous workers are still stopping. Try again shortly.")
+            return
         self._histories.clear()
         self._stats.clear()
         self._surface_trajectories.clear()
+        self._finished_workers = 0
+
+        try:
+            model_task = self._create_model().task
+            X_train, X_test, self._y_train, self._y_test = train_test_split(
+                self._X,
+                self._y,
+                test_fraction=self.spin_test_split.value() / 100,
+                task=model_task,
+                seed=42,
+            )
+            self._X_train, self._X_test, self._X_model = standardize_from_training(
+                X_train, X_test, self._X
+            )
+        except ValueError as exc:
+            self.status_label.setText(f"Cannot start experiment: {exc}")
+            QMessageBox.warning(self, "Invalid train/test split", str(exc))
+            return
 
         algs = [self.cb_algorithm.currentText()]
         cmp  = self.cb_compare.currentText()
-        if cmp and cmp != "— Compare with —":
+        if cmp and cmp != COMPARE_PLACEHOLDER and cmp not in algs:
             algs.append(cmp)
 
         launched = 0
@@ -832,27 +928,29 @@ class MainWindow(QMainWindow):
         if launched > 0:
             self.btn_start.setEnabled(False)
             self.btn_pause.setEnabled(True)
+            self._set_experiment_controls_enabled(False)
 
     def _launch_worker(self, alg_name: str):
         model = self._create_model()
-        model.fit_data(self._X, self._y)
+        model.fit_data(self._X_train, self._y_train)
 
         lr  = self.spin_lr.value()
-        opt = ALGORITHMS[alg_name](learning_rate=lr)
+        opt = OPTIMIZATION_ALGORITHMS[alg_name](learning_rate=lr)
         opt.history["params"].append(model.params.copy())
 
         w = TrainingWorker(
             model=model, optimizer=opt,
-            X=self._X, y=self._y,
+            X=self._X_train, y=self._y_train,
+            X_eval=self._X_test, y_eval=self._y_test,
             n_iterations=self.spin_iter.value(),
             batch_size=self.spin_batch.value(),
             emit_every=self.spin_emit.value(),
         )
         w.step_done.connect(lambda p, n=alg_name: self._on_step(p, n))
         w.finished.connect( lambda p, n=alg_name: self._on_finished(p, n))
-        w.error.connect(lambda msg: self.status_label.setText(f"Error: {msg}"))
-        w.start()
+        w.error.connect(lambda msg, n=alg_name: self._on_worker_error(msg, n))
         self._workers.append(w)
+        w.start()
 
     @pyqtSlot(dict)
     def _on_step(self, payload: dict, name: str):
@@ -864,6 +962,8 @@ class MainWindow(QMainWindow):
             self.stat_time.set_value(round(payload["elapsed"], 2))
             if "accuracy" in payload:
                 self.stat_acc.set_value(round(payload["accuracy"] * 100, 1))
+            elif "r2" in payload:
+                self.stat_acc.set_value(round(payload["r2"] * 100, 1))
 
         params = payload["params"]
         if len(params) >= 2:
@@ -884,7 +984,14 @@ class MainWindow(QMainWindow):
             "time":       payload["elapsed"],
             "iterations": payload["iteration"],
             "accuracy":   payload.get("accuracy"),
+            "r2":         payload.get("r2"),
+            "rmse":       payload.get("rmse"),
         }
+        if name == self.cb_algorithm.currentText():
+            if "accuracy" in payload:
+                self.stat_acc.set_value(round(payload["accuracy"] * 100, 1))
+            elif "r2" in payload:
+                self.stat_acc.set_value(round(payload["r2"] * 100, 1))
         try:
             saved_path = self._save_confusion_matrix(name)
             saved_message = f"  |  PNG: {saved_path.name}" if saved_path else ""
@@ -895,10 +1002,46 @@ class MainWindow(QMainWindow):
             f"  iters={payload['iteration']}  t={payload['elapsed']:.2f}s"
             f"{saved_message}"
         )
-        if len(self._stats) >= len(self._workers):
+        self._finished_workers += 1
+        self._finish_experiment_if_ready()
+
+    def _on_worker_error(self, message: str, name: str):
+        self._finished_workers += 1
+        self.status_label.setText(f"{name} failed: {message}")
+        self._finish_experiment_if_ready()
+
+    def _finish_experiment_if_ready(self):
+        if self._finished_workers >= len(self._workers):
             self.btn_start.setEnabled(True)
             self.btn_pause.setEnabled(False)
-            self._refresh_all_tabs()
+            self._set_experiment_controls_enabled(True)
+            if self._stats:
+                self._refresh_all_tabs()
+
+    def _set_experiment_controls_enabled(self, enabled: bool):
+        for widget in (
+            self.cb_algorithm,
+            self.cb_compare,
+            self.cb_model,
+            self.cb_dataset,
+            self.spin_dataset_size,
+            self.btn_generate_dataset,
+            self.btn_csv,
+            self.spin_ridge_lambda,
+            self.spin_lr,
+            self.spin_iter,
+            self.spin_batch,
+            self.spin_emit,
+            self.spin_test_split,
+        ):
+            widget.setEnabled(enabled)
+        if enabled:
+            is_csv = self.cb_dataset.currentText().startswith("CSV: ")
+            self.spin_dataset_size.setEnabled(not is_csv)
+            self.btn_generate_dataset.setEnabled(not is_csv)
+            self.spin_ridge_lambda.setEnabled(
+                self.cb_model.currentText() == "Ridge Regression"
+            )
 
     def _save_confusion_matrix(self, optimizer_name: str) -> Path | None:
         worker = next(
@@ -908,8 +1051,8 @@ class MainWindow(QMainWindow):
         if worker is None or worker.model.task != "classification":
             return None
 
-        predicted = worker.model.predict_class(self._X)
-        matrix = binary_confusion_matrix(self._y, predicted)
+        predicted = worker.model.predict_class(self._X_test)
+        matrix = binary_confusion_matrix(self._y_test, predicted)
         dataset_name = self.cb_dataset.currentText().removeprefix("CSV: ")
 
         def safe_name(value: str) -> str:
@@ -924,7 +1067,7 @@ class MainWindow(QMainWindow):
         )
         figure = plot_confusion_matrix(
             matrix,
-            title=f"{dataset_name} — {optimizer_name}",
+            title=f"{dataset_name} — {optimizer_name} (test set)",
         )
         figure.savefig(
             output_path,
@@ -948,15 +1091,15 @@ class MainWindow(QMainWindow):
         self.canvas_loss.draw_idle()
 
     def _update_fit_tab(self):
-        if self._X is None or not self._workers:
+        if self._X_model is None or not self._workers:
             return
         self.fig_fit.clear()
         if self._workers[0].model.task == "regression":
             params_map = {w.optimizer.name: w.model.params.copy() for w in self._workers}
-            plot_regression_fit(self._X, self._y, params_map, fig=self.fig_fit)
+            plot_regression_fit(self._X_model, self._y, params_map, fig=self.fig_fit)
         else:
             plot_decision_boundary(
-                self._X, self._y, self._workers[0].model,
+                self._X_model, self._y, self._workers[0].model,
                 optimizer_name=self.cb_algorithm.currentText(),
                 fig=self.fig_fit,
             )
@@ -967,13 +1110,13 @@ class MainWindow(QMainWindow):
             return
         try:
             w = self._workers[0]
-            B, W, Z = build_loss_surface(w.model, self._X, self._y, resolution=35)
+            B, W, Z = build_loss_surface(w.model, w.X, w.y, resolution=35)
             plot_loss_surface_3d(
                 B, W, Z, trajectories=self._surface_trajectories, fig=self.fig_3d
             )
             self.canvas_3d.draw_idle()
-        except Exception:
-            pass
+        except Exception as exc:
+            self.status_label.setText(f"3D plot unavailable: {exc}")
 
     def _update_compare_tab(self):
         if not self._stats:
@@ -988,7 +1131,9 @@ class MainWindow(QMainWindow):
         self.btn_pause.setText("▶  Resume" if paused else "⏸  Pause")
 
     def _reset(self):
-        self._reset_workers()
+        if not self._reset_workers():
+            self.status_label.setText("Cannot reset while a worker is still stopping.")
+            return
         self._histories.clear()
         self._stats.clear()
         self._surface_trajectories.clear()
@@ -1008,13 +1153,20 @@ class MainWindow(QMainWindow):
         self.btn_start.setEnabled(True)
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("⏸  Pause")
+        self._set_experiment_controls_enabled(True)
         self.status_label.setText("Reset. Configure and press ▶ Start.")
 
-    def _reset_workers(self):
-        for w in self._workers:
+    def _reset_workers(self, timeout_ms: int = 3000) -> bool:
+        workers = list(self._workers)
+        for w in workers:
             w.stop()
-            w.wait(500)
-        self._workers.clear()
+        still_running = []
+        for w in workers:
+            if not w.wait(timeout_ms) and w.isRunning():
+                still_running.append(w)
+        self._workers = still_running
+        self._finished_workers = 0
+        return not still_running
 
     def _setup_tab_refresh(self):
         self.tabs.currentChanged.connect(lambda _: (
@@ -1024,8 +1176,17 @@ class MainWindow(QMainWindow):
         ))
 
     def closeEvent(self, event):
-        self._reset_workers()
+        if not self._reset_workers(timeout_ms=5000):
+            self.status_label.setText("Waiting for optimization workers to stop before closing.")
+            event.ignore()
+            return
         for w in self._scenario_workers.values():
-            w.quit(); w.wait(500)
+            w.quit()
+            if not w.wait(3000) and w.isRunning():
+                self.status_label.setText("Waiting for scenario computation to finish.")
+                event.ignore()
+                return
         self.rec_panel.closeEvent(event)
+        if not event.isAccepted():
+            return
         super().closeEvent(event)

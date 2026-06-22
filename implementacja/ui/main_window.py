@@ -9,9 +9,9 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QComboBox, QSpinBox, QDoubleSpinBox,
     QGroupBox, QTabWidget, QFileDialog, QFrame, QGridLayout,
-    QSizePolicy, QScrollArea, QSplitter, QTextEdit, QInputDialog, QMessageBox,
+    QSizePolicy, QScrollArea, QTextEdit, QInputDialog, QMessageBox,
 )
-from PyQt6.QtCore import Qt, pyqtSlot, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QFont, QColor
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -20,10 +20,6 @@ from matplotlib.figure import Figure
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from algorithms import ALGORITHMS
-from algorithms.adam_failures import (
-    scenario_sparse_gradients, scenario_nonstationary,
-    scenario_sharp_vs_flat, scenario_bad_hyperparams,
-)
 from models import MODELS
 from data import (
     DATASETS, DATASET_TASKS, CSVDataError, inspect_csv, load_csv,
@@ -36,7 +32,10 @@ from visualization import (
     plot_comparison, plot_confusion_matrix, build_loss_surface,
     plot_loss_surface_3d, COLORS,
 )
-from visualization.adam_failure_viz import SCENARIO_PLOTS
+from visualization.adam_diagnostics import (
+    analyze_optimizer_comparison,
+    plot_optimizer_comparison,
+)
 from ui.rec_panel import MusicRecommendationPanel
 
 OPTIMIZATION_ALGORITHMS = {
@@ -178,7 +177,6 @@ QTextEdit {
     font-size: 11px; padding: 6px;
     selection-background-color: #1f6feb;
 }
-QSplitter::handle { background: #21262d; }
 """
 
 
@@ -227,25 +225,6 @@ class MplCanvas(FigureCanvas):
         fig.patch.set_facecolor(COLORS["bg"])
 
 
-# ── Background worker for Adam-failure scenarios ──────────────────────────────
-class ScenarioWorker(QThread):
-    done = pyqtSignal(int, dict)
-
-    def __init__(self, idx: int):
-        super().__init__()
-        self.idx = idx
-        self._fns = [
-            scenario_sparse_gradients,
-            scenario_nonstationary,
-            scenario_sharp_vs_flat,
-            scenario_bad_hyperparams,
-        ]
-
-    def run(self):
-        data = self._fns[self.idx]()
-        self.done.emit(self.idx, data)
-
-
 # ── ALG descriptions ──────────────────────────────────────────────────────────
 ALG_INFO = {
     "Gradient Descent":
@@ -259,30 +238,6 @@ ALG_INFO = {
     "ALS":
         "uᵢ = (VᵢᵀVᵢ+λI)⁻¹Vᵢᵀrᵢ\nClosed-form, not gradient-based.\nFor Matrix Factorization — use ♫ tab.",
 }
-
-SCENARIO_META = [
-    {
-        "label": "1 · Sparse Coordinate",
-        "color": "#ff6b6b",
-        "icon":  "⚡",
-    },
-    {
-        "label": "2 · Moving Optimum",
-        "color": "#d29922",
-        "icon":  "🔀",
-    },
-    {
-        "label": "3 · Sharp vs Flat",
-        "color": "#a8ff78",
-        "icon":  "⛰",
-    },
-    {
-        "label": "4 · Extreme Parameters",
-        "color": "#f78166",
-        "icon":  "💥",
-    },
-]
-
 
 # ── Main Window ───────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
@@ -302,8 +257,7 @@ class MainWindow(QMainWindow):
         self._csv_X = self._csv_y = None
         self._finished_workers = 0
         self._current_model = None
-        self._scenario_workers: dict[int, ScenarioWorker] = {}
-        self._scenario_data:    dict[int, dict] = {}
+        self._adam_diagnostic: dict | None = None
 
         self.setStyleSheet(SS)
         self._build_ui()
@@ -335,8 +289,8 @@ class MainWindow(QMainWindow):
         opt_lay.addWidget(self._build_content(), stretch=1)
         self.mode_tabs.addTab(opt_page, "⚙  Optimization")
 
-        # Page 2: Adam Failures
-        self.mode_tabs.addTab(self._build_adam_tab(), "⚠  Adam Failures")
+        # Page 2: controlled Adam vs SGD vs Gradient Descent comparison
+        self.mode_tabs.addTab(self._build_adam_diagnostics_tab(), "✓  Adam Check")
 
         # Page 3: Music Recommendation
         self.rec_panel = MusicRecommendationPanel()
@@ -569,140 +523,177 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.status_label)
         return w
 
-    # ── Adam Failures tab ──────────────────────────────────────────────────────
-    def _build_adam_tab(self) -> QWidget:
-        w   = QWidget()
-        lay = QHBoxLayout(w)
-        lay.setSpacing(0)
-        lay.setContentsMargins(0, 0, 0, 0)
+    # ── Adam vs baseline optimizers on the current experiment ────────────────
+    def _build_adam_diagnostics_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QHBoxLayout(page)
+        layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        # Left: scenario selector sidebar
-        sb = QWidget()
-        sb.setFixedWidth(230)
-        sb.setStyleSheet("background:#010409;border-right:1px solid #21262d;")
-        sl = QVBoxLayout(sb)
-        sl.setContentsMargins(12, 18, 12, 14)
-        sl.setSpacing(10)
+        sidebar = QWidget()
+        sidebar.setFixedWidth(320)
+        sidebar.setStyleSheet("background:#010409;border-right:1px solid #21262d;")
+        side_layout = QVBoxLayout(sidebar)
+        side_layout.setContentsMargins(18, 20, 18, 16)
+        side_layout.setSpacing(12)
 
-        hdr = QLabel("⚠  When Adam Fails")
-        hdr.setStyleSheet(
-            "font-size:13px;font-weight:bold;color:#f78166;letter-spacing:1px;"
+        title = QLabel("✓  ADAM CHECK")
+        title.setStyleSheet(
+            "font-size:15px;font-weight:bold;color:#58a6ff;letter-spacing:1px;"
         )
-        sl.addWidget(hdr)
-        sub = QLabel("Click a scenario to run it.\nAll algorithms from scratch.")
-        sub.setStyleSheet("font-size:9px;color:#7d8590;")
-        sub.setWordWrap(True)
-        sl.addWidget(sub)
+        side_layout.addWidget(title)
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color:#21262d;")
-        sl.addWidget(sep)
+        intro = QLabel(
+            "Porównanie Adam vs SGD vs Gradient Descent na tych samych danych, "
+            "modelu, podziale train/test i learning rate."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("font-size:10px;color:#8b949e;line-height:1.4;")
+        side_layout.addWidget(intro)
 
-        self._scenario_btns: list[QPushButton] = []
-        for i, meta in enumerate(SCENARIO_META):
-            btn = QPushButton(f"{meta['icon']}  {meta['label']}")
-            btn.setStyleSheet(
-                f"QPushButton{{background:#161b22;border:1px solid #30363d;"
-                f"border-radius:7px;color:#e6edf3;text-align:left;padding:8px 12px;"
-                f"font-size:11px;min-height:36px;}}"
-                f"QPushButton:hover{{border-color:{meta['color']};color:{meta['color']};}}"
-                f"QPushButton:pressed{{background:#21262d;}}"
+        self.btn_run_adam_check = QPushButton("▶  Compare Adam vs SGD vs GD")
+        self.btn_run_adam_check.setObjectName("btn_start")
+        self.btn_run_adam_check.clicked.connect(self._run_adam_diagnosis)
+        side_layout.addWidget(self.btn_run_adam_check)
+
+        verdict_box = QGroupBox("Automatic verdict")
+        verdict_layout = QVBoxLayout(verdict_box)
+        self.lbl_adam_verdict = QLabel("NO DATA")
+        self.lbl_adam_verdict.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_adam_verdict.setStyleSheet(
+            "font-size:25px;font-weight:bold;color:#7d8590;padding:10px;"
+            "background:#161b22;border:1px solid #30363d;border-radius:8px;"
+        )
+        verdict_layout.addWidget(self.lbl_adam_verdict)
+        side_layout.addWidget(verdict_box)
+
+        self.lbl_adam_context = QLabel("No Adam experiment yet.")
+        self.lbl_adam_context.setWordWrap(True)
+        self.lbl_adam_context.setStyleSheet(
+            "font-size:10px;color:#8b949e;background:#0d1117;"
+            "border:1px solid #21262d;border-radius:6px;padding:8px;"
+        )
+        side_layout.addWidget(self.lbl_adam_context)
+
+        reasons_box = QGroupBox("What the plots say")
+        reasons_layout = QVBoxLayout(reasons_box)
+        self.txt_adam_reasons = QTextEdit()
+        self.txt_adam_reasons.setReadOnly(True)
+        self.txt_adam_reasons.setPlainText(
+            "Run the comparison to check Adam against SGD and Gradient Descent."
+        )
+        reasons_layout.addWidget(self.txt_adam_reasons)
+        side_layout.addWidget(reasons_box, stretch=1)
+
+        layout.addWidget(sidebar)
+
+        chart_panel = QWidget()
+        chart_layout = QVBoxLayout(chart_panel)
+        chart_layout.setContentsMargins(10, 10, 10, 10)
+        self.fig_adam_diag = Figure()
+        self.canvas_adam_diag = MplCanvas(self.fig_adam_diag)
+        chart_layout.addWidget(self.canvas_adam_diag, stretch=1)
+        layout.addWidget(chart_panel, stretch=1)
+
+        self._set_adam_diagnostic_placeholder(
+            "Uruchom porównanie na bieżącym modelu i datasecie."
+        )
+        return page
+
+    def _set_adam_diagnostic_placeholder(self, message: str):
+        diagnostic = analyze_optimizer_comparison({})
+        diagnostic["reasons"] = [message]
+        self._adam_diagnostic = diagnostic
+        if hasattr(self, "fig_adam_diag"):
+            plot_optimizer_comparison(diagnostic, self.fig_adam_diag)
+            self.canvas_adam_diag.draw_idle()
+        if hasattr(self, "lbl_adam_verdict"):
+            self.lbl_adam_verdict.setText("NO DATA")
+            self.lbl_adam_verdict.setStyleSheet(
+                "font-size:25px;font-weight:bold;color:#7d8590;padding:10px;"
+                "background:#161b22;border:1px solid #30363d;border-radius:8px;"
             )
-            btn.clicked.connect(lambda checked, idx=i: self._run_scenario(idx))
-            sl.addWidget(btn)
-            self._scenario_btns.append(btn)
+            self.txt_adam_reasons.setPlainText(message)
 
-        sl.addStretch()
-
-        # "Running…" label
-        self.lbl_scenario_status = QLabel("")
-        self.lbl_scenario_status.setStyleSheet("font-size:10px;color:#58a6ff;")
-        self.lbl_scenario_status.setWordWrap(True)
-        sl.addWidget(self.lbl_scenario_status)
-
-        lay.addWidget(sb)
-
-        # Right: splitter with chart + explanation
-        right = QWidget()
-        rl    = QVBoxLayout(right)
-        rl.setContentsMargins(0, 0, 0, 0)
-        rl.setSpacing(0)
-
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.setStyleSheet("QSplitter::handle{background:#21262d;height:3px;}")
-
-        # Chart area
-        self.fig_adam_fail = Figure(tight_layout=True)
-        self.canvas_adam_fail = MplCanvas(self.fig_adam_fail)
-        splitter.addWidget(self.canvas_adam_fail)
-
-        # Explanation panel
-        exp_w = QWidget()
-        exp_w.setStyleSheet("background:#010409;border-top:1px solid #21262d;")
-        exp_l = QVBoxLayout(exp_w)
-        exp_l.setContentsMargins(14, 10, 14, 10)
-
-        exp_hdr = QLabel("WHAT THIS EXPERIMENT SHOWS")
-        exp_hdr.setStyleSheet(
-            "font-size:10px;font-weight:bold;color:#f78166;letter-spacing:2px;"
+    def _run_adam_diagnosis(self):
+        if any(worker.isRunning() for worker in self._workers):
+            self.txt_adam_reasons.setPlainText(
+                "Poczekaj na zakończenie bieżącego eksperymentu."
+            )
+            return
+        current_lr = self.spin_lr.value()
+        self.cb_algorithm.setCurrentText("Adam")
+        self.spin_lr.setValue(current_lr)
+        self.cb_compare.setCurrentText(COMPARE_PLACEHOLDER)
+        self.lbl_adam_verdict.setText("RUNNING…")
+        self.lbl_adam_verdict.setStyleSheet(
+            "font-size:25px;font-weight:bold;color:#58a6ff;padding:10px;"
+            "background:#161b22;border:1px solid #58a6ff;border-radius:8px;"
         )
-        exp_l.addWidget(exp_hdr)
-
-        self.txt_explanation = QTextEdit()
-        self.txt_explanation.setReadOnly(True)
-        self.txt_explanation.setMaximumHeight(220)
-        self.txt_explanation.setPlainText(
-            "Select a scenario from the left panel to see the explanation.\n\n"
-            "Each scenario isolates one behavior of Adam and compares the actual\n"
-            "trajectory with simpler optimizers. Read the plot and explanation\n"
-            "together: not every scenario implies divergence."
+        self.txt_adam_reasons.setPlainText(
+            "Trwa kontrolowane porównanie Adam, SGD i Gradient Descent."
         )
-        exp_l.addWidget(self.txt_explanation)
-        splitter.addWidget(exp_w)
-        splitter.setSizes([500, 230])
+        self.btn_run_adam_check.setEnabled(False)
+        self._start(forced_algorithms=["Adam", "SGD", "Gradient Descent"])
+        if not any(worker.isRunning() for worker in self._workers):
+            self.btn_run_adam_check.setEnabled(True)
 
-        rl.addWidget(splitter)
-        lay.addWidget(right, stretch=1)
-        return w
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Adam failure scenarios
-    # ══════════════════════════════════════════════════════════════════════════
-    def _run_scenario(self, idx: int):
-        # Disable button while computing
-        btn = self._scenario_btns[idx]
-        btn.setEnabled(False)
-        self.lbl_scenario_status.setText(f"Computing scenario {idx+1}…")
-
-        if idx in self._scenario_data:
-            # Already computed — just redraw
-            self._draw_scenario(idx, self._scenario_data[idx])
-            btn.setEnabled(True)
-            self.lbl_scenario_status.setText("")
+    def _update_adam_diagnostics(self):
+        histories = {
+            item.optimizer.name: item.optimizer.history
+            for item in self._workers
+            if item.optimizer.name in {"Adam", "SGD", "Gradient Descent"}
+            and item.optimizer.history["loss"]
+        }
+        if "Adam" not in histories:
+            self._set_adam_diagnostic_placeholder(
+                "Ostatni eksperyment nie zawierał Adama. Użyj przycisku porównania."
+            )
             return
 
-        worker = ScenarioWorker(idx)
-        worker.done.connect(self._on_scenario_done)
-        self._scenario_workers[idx] = worker
-        worker.start()
+        diagnostic = analyze_optimizer_comparison(histories)
+        self._adam_diagnostic = diagnostic
+        plot_optimizer_comparison(diagnostic, self.fig_adam_diag)
+        self.canvas_adam_diag.draw_idle()
 
-    @pyqtSlot(int, dict)
-    def _on_scenario_done(self, idx: int, data: dict):
-        self._scenario_data[idx] = data
-        self._draw_scenario(idx, data)
-        self._scenario_btns[idx].setEnabled(True)
-        self.lbl_scenario_status.setText("Done.")
-
-    def _draw_scenario(self, idx: int, data: dict):
-        plot_fn = SCENARIO_PLOTS[idx]
-        plot_fn(data, self.fig_adam_fail)
-        self.canvas_adam_fail.draw_idle()
-        self.txt_explanation.setPlainText(
-            data.get("why_fails", "No explanation available.")
+        verdict = diagnostic["verdict"]
+        color = diagnostic["color"]
+        self.lbl_adam_verdict.setText(verdict)
+        self.lbl_adam_verdict.setStyleSheet(
+            f"font-size:25px;font-weight:bold;color:{color};padding:10px;"
+            f"background:#161b22;border:1px solid {color};border-radius:8px;"
         )
-        # Switch to Adam Failures tab
-        self.mode_tabs.setCurrentIndex(1)
+
+        metrics = diagnostic.get("metrics", {})
+        reduction = metrics.get("loss_reduction")
+        reduction_text = "—" if reduction is None else f"{reduction * 100:.1f}%"
+        methods = ", ".join(histories)
+        self.lbl_adam_context.setText(
+            f"Model: {self.cb_model.currentText()}\n"
+            f"Dataset: {self.cb_dataset.currentText()}\n"
+            f"Methods: {methods}\n"
+            f"Shared learning rate: {self.spin_lr.value():g}\n"
+            f"Iterations: {metrics.get('iterations', 0)}\n"
+            f"Adam loss reduction: {reduction_text}"
+        )
+        reason_lines = [f"- {reason}" for reason in diagnostic["reasons"]]
+        if metrics:
+            reason_lines.extend([
+                "",
+                f"Best loss: {metrics['best_loss']:.6g} (iteration {metrics['best_iteration']})",
+                f"Final trend loss: {metrics['final_loss']:.6g}",
+                f"Gradient ratio (end/start): {metrics['gradient_ratio']:.3g}",
+                f"Step ratio (end/start): {metrics['step_ratio']:.3g}",
+            ])
+            final_losses = metrics.get("final_losses", {})
+            if final_losses:
+                reason_lines.extend([
+                    "",
+                    "Final trend loss:",
+                    *[f"  {name}: {loss:.6g}" for name, loss in final_losses.items()],
+                ])
+        self.txt_adam_reasons.setPlainText("\n".join(reason_lines))
+        self.btn_run_adam_check.setEnabled(True)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Optimization tab logic
@@ -882,7 +873,7 @@ class MainWindow(QMainWindow):
             return model_class(regularization=self.spin_ridge_lambda.value())
         return model_class()
 
-    def _start(self):
+    def _start(self, _checked=False, forced_algorithms=None):
         if self._X is None:
             self._load_dataset()
         if not self._reset_workers():
@@ -910,10 +901,25 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid train/test split", str(exc))
             return
 
-        algs = [self.cb_algorithm.currentText()]
-        cmp  = self.cb_compare.currentText()
-        if cmp and cmp != COMPARE_PLACEHOLDER and cmp not in algs:
-            algs.append(cmp)
+        if forced_algorithms is None:
+            algs = [self.cb_algorithm.currentText()]
+            cmp = self.cb_compare.currentText()
+            if cmp and cmp != COMPARE_PLACEHOLDER and cmp not in algs:
+                algs.append(cmp)
+        else:
+            algs = list(dict.fromkeys(forced_algorithms))
+
+        if "Adam" in algs:
+            self.lbl_adam_verdict.setText("RUNNING…")
+            self.txt_adam_reasons.setPlainText(
+                "Zbieram historię loss, gradientów i kroków z bieżącego treningu Adama."
+            )
+            self.btn_run_adam_check.setEnabled(False)
+        else:
+            self._set_adam_diagnostic_placeholder(
+                "Bieżący eksperyment nie używa Adama. Dodaj Adam jako główny optimizer "
+                "lub wybierz go w polu porównania."
+            )
 
         launched = 0
         for alg_name in algs:
@@ -938,12 +944,17 @@ class MainWindow(QMainWindow):
         opt = OPTIMIZATION_ALGORITHMS[alg_name](learning_rate=lr)
         opt.history["params"].append(model.params.copy())
 
+        batch_size = (
+            len(self._y_train)
+            if alg_name == "Gradient Descent"
+            else self.spin_batch.value()
+        )
         w = TrainingWorker(
             model=model, optimizer=opt,
             X=self._X_train, y=self._y_train,
             X_eval=self._X_test, y_eval=self._y_test,
             n_iterations=self.spin_iter.value(),
-            batch_size=self.spin_batch.value(),
+            batch_size=batch_size,
             emit_every=self.spin_emit.value(),
         )
         w.step_done.connect(lambda p, n=alg_name: self._on_step(p, n))
@@ -1008,6 +1019,16 @@ class MainWindow(QMainWindow):
     def _on_worker_error(self, message: str, name: str):
         self._finished_workers += 1
         self.status_label.setText(f"{name} failed: {message}")
+        if name == "Adam":
+            self.lbl_adam_verdict.setText("FAILURE")
+            self.lbl_adam_verdict.setStyleSheet(
+                "font-size:25px;font-weight:bold;color:#f85149;padding:10px;"
+                "background:#161b22;border:1px solid #f85149;border-radius:8px;"
+            )
+            self.txt_adam_reasons.setPlainText(
+                f"Trening zakończył się wyjątkiem:\n{message}"
+            )
+            self.btn_run_adam_check.setEnabled(True)
         self._finish_experiment_if_ready()
 
     def _finish_experiment_if_ready(self):
@@ -1015,8 +1036,11 @@ class MainWindow(QMainWindow):
             self.btn_start.setEnabled(True)
             self.btn_pause.setEnabled(False)
             self._set_experiment_controls_enabled(True)
+            self.btn_run_adam_check.setEnabled(True)
             if self._stats:
                 self._refresh_all_tabs()
+            if any(worker.optimizer.name == "Adam" for worker in self._workers):
+                self._update_adam_diagnostics()
 
     def _set_experiment_controls_enabled(self, enabled: bool):
         for widget in (
@@ -1154,6 +1178,11 @@ class MainWindow(QMainWindow):
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("⏸  Pause")
         self._set_experiment_controls_enabled(True)
+        self.btn_run_adam_check.setEnabled(True)
+        self.lbl_adam_context.setText("No Adam experiment yet.")
+        self._set_adam_diagnostic_placeholder(
+            "Uruchom Adam na bieżącym modelu i datasecie."
+        )
         self.status_label.setText("Reset. Configure and press ▶ Start.")
 
     def _reset_workers(self, timeout_ms: int = 3000) -> bool:
@@ -1180,12 +1209,6 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Waiting for optimization workers to stop before closing.")
             event.ignore()
             return
-        for w in self._scenario_workers.values():
-            w.quit()
-            if not w.wait(3000) and w.isRunning():
-                self.status_label.setText("Waiting for scenario computation to finish.")
-                event.ignore()
-                return
         self.rec_panel.closeEvent(event)
         if not event.isAccepted():
             return

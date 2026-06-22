@@ -12,6 +12,14 @@
 | **Newton Method** | Drugiego rzędu | θ ← θ − α·H⁻¹·∇L — kwadratowa zbieżność |
 | **ALS** | Closed-form | Alternating Least Squares dla Matrix Factorization |
 
+### Adam Check (diagnostyka rzeczywistego treningu)
+- uruchamia kontrolowane porównanie `Adam` vs `SGD` vs `Gradient Descent` na tym samym modelu, datasecie, podziale train/test i learning rate
+- pokazuje wspólne wykresy wygładzonego lossu, normy gradientu i normy kroku oraz zestawienie końcowego lossu
+- `Gradient Descent` używa pełnego zbioru treningowego, a Adam i SGD wybranego mini-batcha
+- wykrywa NaN/∞, eksplozję lossu, stagnację oraz sytuację, w której Adam wypada gorzej od metod bazowych
+- zwraca werdykt `OK`, `WARNING` albo `FAILURE` wraz z uzasadnieniem
+- nie uruchamia osobnych, syntetycznych scenariuszy „Adam Failures”
+
 ### Music Recommendation (nowa zakładka ♫)
 - Matrix Factorization: `R ≈ U · V^T` trenowana przez ALS
 - Synthetic Last.fm dataset (80 użytkowników, 25 artystów, klastry gatunków)
@@ -35,7 +43,7 @@
 
 ```bash
 pip install -r requirements.txt
-python main.py
+python implementacja/main.py
 ```
 
 ---

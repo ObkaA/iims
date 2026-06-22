@@ -12,28 +12,16 @@ Algorithm (per Kingma & Ba, Algorithm 1):
         v̂  ← v / (1 - β₂ᵗ)
         θ  ← θ - α·m̂ / (√v̂ + ε)      # adaptive update
 
-WHY ADAM SOMETIMES FAILS (see adam_failure_scenarios.py for live demos):
+WHAT THE ADAM CHECK DIAGNOSES ON A REAL TRAINING RUN:
 ────────────────────────────────────────────────────────────────────────
-1. NON-STATIONARY OBJECTIVES: v accumulates a long memory of past gradient
-   magnitudes. If the loss landscape changes suddenly (e.g. curriculum
-   learning, changing data distribution), v̂ is stale → wrong scale.
+1. LOSS TREND: raw mini-batch loss and its smoothed trend.
+2. GRADIENT NORM: whether the optimization signal is shrinking.
+3. PARAMETER-STEP NORM: whether Adam settles near a solution or keeps jumping.
+4. REGRESSION FROM THE BEST POINT: whether the final iterations undo progress.
+5. NUMERICAL HEALTH: NaN, infinity, explosion, stagnation, and instability.
 
-2. SPARSE + INFREQUENT GRADIENTS: Per-coordinate normalization may keep a
-   rare coordinate's update close to α instead of letting it shrink in direct
-   proportion to the raw gradient. This can leave residual oscillation.
-
-3. IMPLICIT OPTIMIZER BIAS: Adaptive methods and SGD can select different
-   basins. In some deep-learning experiments adaptive methods find sharper
-   solutions while momentum SGD reaches flatter ones; this is not universal.
-
-4. VERY SMALL DATASETS: With few samples, the stochastic noise in gradients
-   is low. Adam's correction for variance becomes unnecessary overhead and
-   can introduce oscillation around the optimum.
-
-5. POORLY TUNED β₁ OR α: β₁ close to 1 gives the signed-gradient estimate
-   very long memory, while a very large α causes oscillatory transients.
-   Bias correction is not itself a 1/(1-β₁) amplification of the first step:
-   the same factor is present in the initial moment update and cancels out.
+The diagnosis uses the exact model, dataset and optimizer history produced by
+the Optimization tab. It does not run separate synthetic failure scenarios.
 """
 import numpy as np
 from .base import BaseOptimizer

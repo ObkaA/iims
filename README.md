@@ -14,10 +14,13 @@
 
 ### Adam Check (diagnostyka rzeczywistego treningu)
 - uruchamia kontrolowane porównanie `Adam` vs `SGD` vs `Gradient Descent` na tym samym modelu, datasecie, podziale train/test i learning rate
-- pokazuje wspólne wykresy wygładzonego lossu, normy gradientu i normy kroku oraz zestawienie końcowego lossu
+- zachowuje konfigurację z zakładki Optimization i nie zmienia wybranego algorytmu ani hiperparametrów
+- Adam i SGD korzystają z tej samej deterministycznej sekwencji mini-batchy; każdy optimizer startuje od świeżych, identycznych parametrów modelu
+- pokazuje wspólne wykresy lossu mierzonego na tej samej deterministycznej próbce testowej, normy gradientu i normy kroku, ranking oraz trajektorie parametrów
+- trajektoria używa bezpośrednio `θ₀–θ₁` dla dwóch parametrów i wspólnej projekcji PCA dla modeli wielowymiarowych
 - `Gradient Descent` używa pełnego zbioru treningowego, a Adam i SGD wybranego mini-batcha
-- wykrywa NaN/∞, eksplozję lossu, stagnację oraz sytuację, w której Adam wypada gorzej od metod bazowych
-- zwraca werdykt `OK`, `WARNING` albo `FAILURE` wraz z uzasadnieniem
+- `Adam Health` wykrywa NaN/∞, eksplozję lossu, stagnację i niestabilność oraz zwraca werdykt `OK`, `WARNING` albo `FAILURE`
+- osobny fixed-config benchmark pokazuje zwycięzcę i ranking; słabszy wynik Adama nie zmienia jego werdyktu zdrowia
 - nie uruchamia osobnych, syntetycznych scenariuszy „Adam Failures”
 
 ### Music Recommendation (nowa zakładka ♫)

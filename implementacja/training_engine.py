@@ -6,6 +6,9 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from metrics import regression_scores
 
+MAX_DIAGNOSTIC_EVAL_SAMPLES = 512
+MAX_DIAGNOSTIC_POINTS = 300
+
 
 class TrainingWorker(QThread):
     """Runs one optimiser × model combination and emits progress signals."""
@@ -15,7 +18,7 @@ class TrainingWorker(QThread):
     error     = pyqtSignal(str)
 
     def __init__(self, model, optimizer, X, y, X_eval=None, y_eval=None,
-                 n_iterations=200, batch_size=32, emit_every=1):
+                 n_iterations=200, batch_size=32, emit_every=1, random_seed=42):
         super().__init__()
         self.model        = model
         self.optimizer    = optimizer
@@ -26,9 +29,21 @@ class TrainingWorker(QThread):
         self.n_iterations = n_iterations
         self.batch_size   = batch_size
         self.emit_every   = emit_every
+        self.random_seed  = random_seed
         self._paused      = False
         self._stopped     = False
         self.start_time   = None
+
+        eval_size = len(self.y_eval)
+        if eval_size > MAX_DIAGNOSTIC_EVAL_SAMPLES:
+            diagnostic_indices = np.linspace(
+                0, eval_size - 1, MAX_DIAGNOSTIC_EVAL_SAMPLES, dtype=int
+            )
+            self._X_diagnostic = self.X_eval[diagnostic_indices]
+            self._y_diagnostic = self.y_eval[diagnostic_indices]
+        else:
+            self._X_diagnostic = self.X_eval
+            self._y_diagnostic = self.y_eval
 
     def pause(self):  self._paused = not self._paused
     def stop(self):   self._stopped = True; self._paused = False
@@ -42,6 +57,10 @@ class TrainingWorker(QThread):
         n = len(y)
         self.start_time = time.time()
         use_newton = opt.name == "Newton Method"
+        rng = np.random.default_rng(self.random_seed)
+        diagnostic_every = max(
+            1, int(np.ceil(self.n_iterations / MAX_DIAGNOSTIC_POINTS))
+        )
 
         for i in range(self.n_iterations):
             while self._paused and not self._stopped:
@@ -51,7 +70,7 @@ class TrainingWorker(QThread):
 
             # Mini-batch
             if self.batch_size < n:
-                idx = np.random.choice(n, self.batch_size, replace=False)
+                idx = rng.choice(n, self.batch_size, replace=False)
                 X_b, y_b = X[idx], y[idx]
             else:
                 X_b, y_b = X, y
@@ -67,6 +86,17 @@ class TrainingWorker(QThread):
                 new_params = opt.step(params, grad)
 
             opt.record(loss, new_params, grad)
+            should_diagnose = (
+                i % diagnostic_every == 0 or i == self.n_iterations - 1
+            )
+            if should_diagnose:
+                # All optimizers use the same deterministic held-out sample.
+                # Sampling and limiting the number of points keeps large CSV
+                # experiments responsive without influencing the updates.
+                opt.history["eval_loss"].append(float(model.loss(
+                    new_params, self._X_diagnostic, self._y_diagnostic
+                )))
+                opt.history["eval_iteration"].append(i)
             model.params = new_params
 
             if i % self.emit_every == 0 or i == self.n_iterations - 1:

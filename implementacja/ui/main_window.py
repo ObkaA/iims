@@ -256,6 +256,7 @@ class MainWindow(QMainWindow):
         self._csv_task: str | None = None
         self._csv_X = self._csv_y = None
         self._finished_workers = 0
+        self._active_primary_algorithm: str | None = None
         self._current_model = None
         self._adam_diagnostic: dict | None = None
 
@@ -556,7 +557,7 @@ class MainWindow(QMainWindow):
         self.btn_run_adam_check.clicked.connect(self._run_adam_diagnosis)
         side_layout.addWidget(self.btn_run_adam_check)
 
-        verdict_box = QGroupBox("Automatic verdict")
+        verdict_box = QGroupBox("Adam health")
         verdict_layout = QVBoxLayout(verdict_box)
         self.lbl_adam_verdict = QLabel("NO DATA")
         self.lbl_adam_verdict.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -566,6 +567,18 @@ class MainWindow(QMainWindow):
         )
         verdict_layout.addWidget(self.lbl_adam_verdict)
         side_layout.addWidget(verdict_box)
+
+        comparison_box = QGroupBox("Fixed-config benchmark")
+        comparison_layout = QVBoxLayout(comparison_box)
+        self.lbl_optimizer_winner = QLabel("NO DATA")
+        self.lbl_optimizer_winner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_optimizer_winner.setWordWrap(True)
+        self.lbl_optimizer_winner.setStyleSheet(
+            "font-size:13px;font-weight:bold;color:#7d8590;padding:8px;"
+            "background:#161b22;border:1px solid #30363d;border-radius:8px;"
+        )
+        comparison_layout.addWidget(self.lbl_optimizer_winner)
+        side_layout.addWidget(comparison_box)
 
         self.lbl_adam_context = QLabel("No Adam experiment yet.")
         self.lbl_adam_context.setWordWrap(True)
@@ -613,6 +626,11 @@ class MainWindow(QMainWindow):
                 "font-size:25px;font-weight:bold;color:#7d8590;padding:10px;"
                 "background:#161b22;border:1px solid #30363d;border-radius:8px;"
             )
+            self.lbl_optimizer_winner.setText("NO DATA")
+            self.lbl_optimizer_winner.setStyleSheet(
+                "font-size:13px;font-weight:bold;color:#7d8590;padding:8px;"
+                "background:#161b22;border:1px solid #30363d;border-radius:8px;"
+            )
             self.txt_adam_reasons.setPlainText(message)
 
     def _run_adam_diagnosis(self):
@@ -621,11 +639,8 @@ class MainWindow(QMainWindow):
                 "Poczekaj na zakończenie bieżącego eksperymentu."
             )
             return
-        current_lr = self.spin_lr.value()
-        self.cb_algorithm.setCurrentText("Adam")
-        self.spin_lr.setValue(current_lr)
-        self.cb_compare.setCurrentText(COMPARE_PLACEHOLDER)
         self.lbl_adam_verdict.setText("RUNNING…")
+        self.lbl_optimizer_winner.setText("RUNNING…")
         self.lbl_adam_verdict.setStyleSheet(
             "font-size:25px;font-weight:bold;color:#58a6ff;padding:10px;"
             "background:#161b22;border:1px solid #58a6ff;border-radius:8px;"
@@ -665,6 +680,18 @@ class MainWindow(QMainWindow):
         )
 
         metrics = diagnostic.get("metrics", {})
+        winner = metrics.get("comparison_winner")
+        adam_rank = metrics.get("adam_rank")
+        if winner:
+            self.lbl_optimizer_winner.setText(
+                f"BEST: {winner}\nAdam rank: {adam_rank}/{len(metrics['ranking'])}"
+            )
+            self.lbl_optimizer_winner.setStyleSheet(
+                "font-size:13px;font-weight:bold;color:#58a6ff;padding:8px;"
+                "background:#161b22;border:1px solid #58a6ff;border-radius:8px;"
+            )
+        else:
+            self.lbl_optimizer_winner.setText("NO COMPARISON")
         reduction = metrics.get("loss_reduction")
         reduction_text = "—" if reduction is None else f"{reduction * 100:.1f}%"
         methods = ", ".join(histories)
@@ -672,16 +699,21 @@ class MainWindow(QMainWindow):
             f"Model: {self.cb_model.currentText()}\n"
             f"Dataset: {self.cb_dataset.currentText()}\n"
             f"Methods: {methods}\n"
-            f"Shared learning rate: {self.spin_lr.value():g}\n"
+            f"Shared learning rate: {self.spin_lr.value():g} (not tuned)\n"
+            f"Shared mini-batch seed: 42\n"
             f"Iterations: {metrics.get('iterations', 0)}\n"
             f"Adam loss reduction: {reduction_text}"
         )
-        reason_lines = [f"- {reason}" for reason in diagnostic["reasons"]]
+        reason_lines = [
+            "ADAM HEALTH",
+            *[f"- {reason}" for reason in diagnostic["reasons"]],
+        ]
         if metrics:
             reason_lines.extend([
                 "",
-                f"Best loss: {metrics['best_loss']:.6g} (iteration {metrics['best_iteration']})",
-                f"Final trend loss: {metrics['final_loss']:.6g}",
+                f"Best Adam training loss: {metrics['best_loss']:.6g} "
+                f"(iteration {metrics['best_iteration']})",
+                f"Final Adam training-loss trend: {metrics['final_loss']:.6g}",
                 f"Gradient ratio (end/start): {metrics['gradient_ratio']:.3g}",
                 f"Step ratio (end/start): {metrics['step_ratio']:.3g}",
             ])
@@ -689,7 +721,10 @@ class MainWindow(QMainWindow):
             if final_losses:
                 reason_lines.extend([
                     "",
-                    "Final trend loss:",
+                    "FIXED-CONFIG BENCHMARK",
+                    diagnostic["comparison_summary"],
+                    "All loss curves use the same held-out evaluation sample.",
+                    "Final evaluation-loss trend:",
                     *[f"  {name}: {loss:.6g}" for name, loss in final_losses.items()],
                 ])
         self.txt_adam_reasons.setPlainText("\n".join(reason_lines))
@@ -909,10 +944,16 @@ class MainWindow(QMainWindow):
         else:
             algs = list(dict.fromkeys(forced_algorithms))
 
+        selected_algorithm = self.cb_algorithm.currentText()
+        self._active_primary_algorithm = (
+            selected_algorithm if selected_algorithm in algs else algs[0]
+        )
+
         if "Adam" in algs:
             self.lbl_adam_verdict.setText("RUNNING…")
+            self.lbl_optimizer_winner.setText("RUNNING…")
             self.txt_adam_reasons.setPlainText(
-                "Zbieram historię loss, gradientów i kroków z bieżącego treningu Adama."
+                "Zbieram wspólny test loss oraz historię gradientów i kroków."
             )
             self.btn_run_adam_check.setEnabled(False)
         else:
@@ -956,6 +997,7 @@ class MainWindow(QMainWindow):
             n_iterations=self.spin_iter.value(),
             batch_size=batch_size,
             emit_every=self.spin_emit.value(),
+            random_seed=42,
         )
         w.step_done.connect(lambda p, n=alg_name: self._on_step(p, n))
         w.finished.connect( lambda p, n=alg_name: self._on_finished(p, n))
@@ -967,7 +1009,7 @@ class MainWindow(QMainWindow):
     def _on_step(self, payload: dict, name: str):
         self._histories.setdefault(name, []).append(payload["loss"])
 
-        if name == self.cb_algorithm.currentText():
+        if name == self._active_primary_algorithm:
             self.stat_loss.set_value(payload["loss"])
             self.stat_iter.set_value(payload["iteration"])
             self.stat_time.set_value(round(payload["elapsed"], 2))
@@ -998,7 +1040,7 @@ class MainWindow(QMainWindow):
             "r2":         payload.get("r2"),
             "rmse":       payload.get("rmse"),
         }
-        if name == self.cb_algorithm.currentText():
+        if name == self._active_primary_algorithm:
             if "accuracy" in payload:
                 self.stat_acc.set_value(round(payload["accuracy"] * 100, 1))
             elif "r2" in payload:
@@ -1021,6 +1063,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"{name} failed: {message}")
         if name == "Adam":
             self.lbl_adam_verdict.setText("FAILURE")
+            self.lbl_optimizer_winner.setText("NOT COMPLETED")
             self.lbl_adam_verdict.setStyleSheet(
                 "font-size:25px;font-weight:bold;color:#f85149;padding:10px;"
                 "background:#161b22;border:1px solid #f85149;border-radius:8px;"

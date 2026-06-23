@@ -10,6 +10,8 @@ class BaseOptimizer(ABC):
         self.learning_rate = learning_rate
         self.history: dict = {
             "loss": [],
+            "eval_loss": [],
+            "eval_iteration": [],
             "params": [],
             "gradients": [],
             "iteration": [],
@@ -22,7 +24,14 @@ class BaseOptimizer(ABC):
         ...
 
     def reset(self):
-        self.history = {"loss": [], "params": [], "gradients": [], "iteration": []}
+        self.history = {
+            "loss": [],
+            "eval_loss": [],
+            "eval_iteration": [],
+            "params": [],
+            "gradients": [],
+            "iteration": [],
+        }
         self.iteration = 0
         self._reset_state()
 

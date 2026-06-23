@@ -12,9 +12,11 @@ sys.path.insert(0, str(PROJECT_ROOT / "implementacja"))
 from visualization.adam_diagnostics import (
     analyze_adam_history,
     analyze_optimizer_comparison,
+    build_parameter_loss_contours,
     plot_adam_diagnostics,
     plot_optimizer_comparison,
 )
+from models.linear_regression import LinearRegressionModel
 
 
 def history(losses, gradient_scale=1.0):
@@ -80,6 +82,26 @@ class AdamDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result["runs"]["Adam"]["comparison_loss_source"], "evaluation")
         self.assertEqual(result["runs"]["Adam"]["comparison_iterations"][-1], 158)
 
+    def test_ranking_uses_shared_processed_data_budget(self):
+        adam = history([10.0, 5.0, 1.0])
+        gd = history([10.0, 1.0, 0.01])
+        for run, samples_per_step in ((adam, 1), (gd, 10)):
+            run["eval_loss"] = list(run["loss"])
+            run["eval_iteration"] = [0, 1, 2]
+            run["diagnostic_gradient_norm"] = [3.0, 2.0, 1.0]
+            run["samples_per_step"] = samples_per_step
+            run["train_size"] = 10
+        result = analyze_optimizer_comparison({
+            "Adam": adam,
+            "Gradient Descent": gd,
+        })
+        self.assertAlmostEqual(result["metrics"]["shared_budget_epochs"], 0.3)
+        self.assertEqual(result["metrics"]["comparison_winner"], "Adam")
+        self.assertEqual(
+            result["runs"]["Adam"]["gradient_source"],
+            "shared training sample",
+        )
+
     def test_comparison_is_ok_when_adam_is_best(self):
         result = analyze_optimizer_comparison({
             "Adam": history(np.geomspace(10.0, 0.1, 80)),
@@ -88,6 +110,16 @@ class AdamDiagnosticsTests(unittest.TestCase):
         })
         self.assertEqual(result["verdict"], "OK")
 
+    def test_near_equal_losses_are_reported_as_tie(self):
+        result = analyze_optimizer_comparison({
+            "Adam": history(np.geomspace(10.0, 0.7543, 80)),
+            "SGD": history(np.geomspace(10.0, 0.7579, 80)),
+            "Gradient Descent": history(np.geomspace(10.0, 0.7534, 80)),
+        })
+        self.assertIsNone(result["metrics"]["comparison_winner"])
+        self.assertTrue(result["metrics"]["comparison_label"].startswith("TIE:"))
+        self.assertIn("Adam", result["metrics"]["comparison_winners"])
+
     def test_comparison_plot_contains_trajectory_and_diagnostics(self):
         result = analyze_optimizer_comparison({
             "Adam": history(np.geomspace(10.0, 0.1, 40)),
@@ -95,9 +127,10 @@ class AdamDiagnosticsTests(unittest.TestCase):
             "Gradient Descent": history(np.geomspace(10.0, 0.7, 40)),
         })
         figure = plot_optimizer_comparison(result, Figure(figsize=(10, 6)))
-        self.assertEqual(len(figure.axes), 6)
+        self.assertEqual(len(figure.axes), 3)
         self.assertEqual(figure.axes[1].get_title(), "Parameter trajectory")
-        self.assertEqual(figure.axes[2].get_title(), "Final evaluation-loss trend")
+        self.assertEqual(figure.axes[2].get_title(), "Evaluation loss at 40.00 epochs")
+        self.assertEqual(figure.axes[0].get_xlabel(), "Epoch")
 
     def test_multidimensional_trajectory_uses_shared_pca_projection(self):
         histories = {}
@@ -111,6 +144,20 @@ class AdamDiagnosticsTests(unittest.TestCase):
         result = analyze_optimizer_comparison(histories)
         self.assertEqual(result["trajectory"]["mode"], "PCA")
         self.assertEqual(result["trajectory"]["paths"]["Adam"].shape, (41, 2))
+
+    def test_two_parameter_surface_marks_estimated_minimum(self):
+        X = np.linspace(-1.0, 1.0, 40).reshape(-1, 1)
+        y = 0.5 + 2.0 * X[:, 0]
+        model = LinearRegressionModel()
+        model.fit_data(X, y)
+        histories = {
+            "Adam": {
+                "params": [np.array([0.0, 0.0]), np.array([0.5, 2.0])]
+            }
+        }
+        surface = build_parameter_loss_contours(model, X, y, histories)
+        self.assertIsNotNone(surface)
+        np.testing.assert_allclose(surface["minimum"], [0.5, 2.0], atol=0.08)
 
 
 if __name__ == "__main__":

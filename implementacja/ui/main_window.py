@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QComboBox, QSpinBox, QDoubleSpinBox,
     QGroupBox, QTabWidget, QFileDialog, QFrame, QGridLayout,
-    QSizePolicy, QScrollArea, QTextEdit, QInputDialog, QMessageBox,
+    QSizePolicy, QScrollArea, QInputDialog, QMessageBox, QCheckBox,
 )
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QFont, QColor
@@ -26,7 +26,7 @@ from data import (
     standardize_from_training, train_test_split,
 )
 from metrics import binary_confusion_matrix
-from training_engine import TrainingWorker
+from training_engine import TrainingWorker, optimizer_steps_for_epochs
 from visualization import (
     plot_loss_curves, plot_regression_fit, plot_decision_boundary,
     plot_comparison, plot_confusion_matrix, build_loss_surface,
@@ -34,6 +34,7 @@ from visualization import (
 )
 from visualization.adam_diagnostics import (
     analyze_optimizer_comparison,
+    build_parameter_loss_contours,
     plot_optimizer_comparison,
 )
 from ui.rec_panel import MusicRecommendationPanel
@@ -42,6 +43,7 @@ OPTIMIZATION_ALGORITHMS = {
     name: optimizer for name, optimizer in ALGORITHMS.items() if name != "ALS"
 }
 COMPARE_PLACEHOLDER = "— Compare with —"
+ADAM_DEMO_DATASET = "Ill-conditioned Linear (Adam demo)"
 
 # ── Stylesheet ─────────────────────────────────────────────────────────────────
 SS = """
@@ -171,12 +173,6 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
     background: transparent;
 }
-QTextEdit {
-    background: #0d1117; color: #c9d1d9;
-    border: 1px solid #21262d; border-radius: 6px;
-    font-size: 11px; padding: 6px;
-    selection-background-color: #1f6feb;
-}
 """
 
 
@@ -234,7 +230,7 @@ ALG_INFO = {
     "Adam":
         "m ← β₁m+(1-β₁)g  |  v ← β₂v+(1-β₂)g²\nθ ← θ − α·m̂/√v̂\nAdaptive per-param step. Fast but see ⚠ tab!",
     "Newton Method":
-        "(H+λI)·Δθ = ∇L  |  θ ← θ − α·Δθ\nUses Hessian. Quadratic convergence.\n~10 iters vs ~300 for GD on logistic regression.",
+        "(H+λI)·Δθ = ∇L  |  θ ← θ − α·Δθ\nUses Hessian. Quadratic convergence.\nUsually needs fewer update steps than GD.",
     "ALS":
         "uᵢ = (VᵢᵀVᵢ+λI)⁻¹Vᵢᵀrᵢ\nClosed-form, not gradient-based.\nFor Matrix Factorization — use ♫ tab.",
 }
@@ -255,6 +251,7 @@ class MainWindow(QMainWindow):
         self._csv_dataset_name: str | None = None
         self._csv_task: str | None = None
         self._csv_X = self._csv_y = None
+        self._loaded_dataset_name: str | None = None
         self._finished_workers = 0
         self._active_primary_algorithm: str | None = None
         self._current_model = None
@@ -403,6 +400,20 @@ class MainWindow(QMainWindow):
         self.btn_csv.setObjectName("btn_csv")
         self.btn_csv.clicked.connect(self._load_csv)
         dl.addWidget(self.btn_csv)
+        self.chk_standardize = QCheckBox("Standardize features")
+        self.chk_standardize.setChecked(True)
+        self.chk_standardize.setToolTip(
+            "Fit mean/std on the training split and apply them to train/test data."
+        )
+        dl.addWidget(self.chk_standardize)
+        self.lbl_scaling_note = QLabel(
+            "Standardization usually makes optimization easier."
+        )
+        self.lbl_scaling_note.setWordWrap(True)
+        self.lbl_scaling_note.setStyleSheet(
+            "font-size:9px;color:#8b949e;padding:4px;"
+        )
+        dl.addWidget(self.lbl_scaling_note)
         lay.addWidget(grp_data)
 
         # Hyperparameters
@@ -420,12 +431,12 @@ class MainWindow(QMainWindow):
         self.spin_lr.setDecimals(5)
         hl.addWidget(self.spin_lr, 0, 1)
 
-        hl.addWidget(QLabel("Iterations"), 1, 0)
-        self.spin_iter = QSpinBox()
-        self.spin_iter.setRange(10, 5000)
-        self.spin_iter.setValue(300)
-        self.spin_iter.setSingleStep(50)
-        hl.addWidget(self.spin_iter, 1, 1)
+        hl.addWidget(QLabel("Epochs"), 1, 0)
+        self.spin_epochs = QSpinBox()
+        self.spin_epochs.setRange(1, 5000)
+        self.spin_epochs.setValue(60)
+        self.spin_epochs.setSingleStep(10)
+        hl.addWidget(self.spin_epochs, 1, 1)
 
         hl.addWidget(QLabel("Batch size"), 2, 0)
         self.spin_batch = QSpinBox()
@@ -433,7 +444,7 @@ class MainWindow(QMainWindow):
         self.spin_batch.setValue(32)
         hl.addWidget(self.spin_batch, 2, 1)
 
-        hl.addWidget(QLabel("Emit every"), 3, 0)
+        hl.addWidget(QLabel("Min UI update steps"), 3, 0)
         self.spin_emit = QSpinBox()
         self.spin_emit.setRange(1, 50)
         self.spin_emit.setValue(2)
@@ -491,7 +502,7 @@ class MainWindow(QMainWindow):
         rl.setSpacing(6)
         self.stat_loss = StatCard("Loss")
         self.stat_acc  = StatCard("Accuracy", "%")
-        self.stat_iter = StatCard("Iteration")
+        self.stat_iter = StatCard("Epoch")
         self.stat_time = StatCard("Time", "s")
         for c in (self.stat_loss, self.stat_acc, self.stat_iter, self.stat_time):
             rl.addWidget(c)
@@ -588,24 +599,22 @@ class MainWindow(QMainWindow):
         )
         side_layout.addWidget(self.lbl_adam_context)
 
-        reasons_box = QGroupBox("What the plots say")
-        reasons_layout = QVBoxLayout(reasons_box)
-        self.txt_adam_reasons = QTextEdit()
-        self.txt_adam_reasons.setReadOnly(True)
-        self.txt_adam_reasons.setPlainText(
-            "Run the comparison to check Adam against SGD and Gradient Descent."
-        )
-        reasons_layout.addWidget(self.txt_adam_reasons)
-        side_layout.addWidget(reasons_box, stretch=1)
+        side_layout.addStretch(1)
 
         layout.addWidget(sidebar)
 
         chart_panel = QWidget()
         chart_layout = QVBoxLayout(chart_panel)
         chart_layout.setContentsMargins(10, 10, 10, 10)
-        self.fig_adam_diag = Figure()
+        self.fig_adam_diag = Figure(figsize=(14, 5))
         self.canvas_adam_diag = MplCanvas(self.fig_adam_diag)
-        chart_layout.addWidget(self.canvas_adam_diag, stretch=1)
+        self.canvas_adam_diag.setMinimumHeight(460)
+        self.canvas_adam_diag.setMaximumHeight(620)
+        self.canvas_adam_diag.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        chart_layout.addWidget(self.canvas_adam_diag)
+        chart_layout.addStretch(1)
         layout.addWidget(chart_panel, stretch=1)
 
         self._set_adam_diagnostic_placeholder(
@@ -631,22 +640,15 @@ class MainWindow(QMainWindow):
                 "font-size:13px;font-weight:bold;color:#7d8590;padding:8px;"
                 "background:#161b22;border:1px solid #30363d;border-radius:8px;"
             )
-            self.txt_adam_reasons.setPlainText(message)
 
     def _run_adam_diagnosis(self):
         if any(worker.isRunning() for worker in self._workers):
-            self.txt_adam_reasons.setPlainText(
-                "Poczekaj na zakończenie bieżącego eksperymentu."
-            )
             return
         self.lbl_adam_verdict.setText("RUNNING…")
         self.lbl_optimizer_winner.setText("RUNNING…")
         self.lbl_adam_verdict.setStyleSheet(
             "font-size:25px;font-weight:bold;color:#58a6ff;padding:10px;"
             "background:#161b22;border:1px solid #58a6ff;border-radius:8px;"
-        )
-        self.txt_adam_reasons.setPlainText(
-            "Trwa kontrolowane porównanie Adam, SGD i Gradient Descent."
         )
         self.btn_run_adam_check.setEnabled(False)
         self._start(forced_algorithms=["Adam", "SGD", "Gradient Descent"])
@@ -667,6 +669,16 @@ class MainWindow(QMainWindow):
             return
 
         diagnostic = analyze_optimizer_comparison(histories)
+        surface_worker = next(
+            (item for item in self._workers if item.optimizer.name == "Adam"),
+            self._workers[0],
+        )
+        diagnostic["loss_surface"] = build_parameter_loss_contours(
+            surface_worker.model,
+            surface_worker._X_gradient_diagnostic,
+            surface_worker._y_gradient_diagnostic,
+            histories,
+        )
         self._adam_diagnostic = diagnostic
         plot_optimizer_comparison(diagnostic, self.fig_adam_diag)
         self.canvas_adam_diag.draw_idle()
@@ -681,10 +693,13 @@ class MainWindow(QMainWindow):
 
         metrics = diagnostic.get("metrics", {})
         winner = metrics.get("comparison_winner")
+        comparison_label = metrics.get("comparison_label")
         adam_rank = metrics.get("adam_rank")
-        if winner:
+        if comparison_label:
+            prefix = "BEST" if winner else "RESULT"
             self.lbl_optimizer_winner.setText(
-                f"BEST: {winner}\nAdam rank: {adam_rank}/{len(metrics['ranking'])}"
+                f"{prefix}: {comparison_label}\n"
+                f"Adam rank: {adam_rank}/{len(metrics['ranking'])}"
             )
             self.lbl_optimizer_winner.setStyleSheet(
                 "font-size:13px;font-weight:bold;color:#58a6ff;padding:8px;"
@@ -701,33 +716,12 @@ class MainWindow(QMainWindow):
             f"Methods: {methods}\n"
             f"Shared learning rate: {self.spin_lr.value():g} (not tuned)\n"
             f"Shared mini-batch seed: 42\n"
-            f"Iterations: {metrics.get('iterations', 0)}\n"
+            f"Standardization: {'ON' if self.chk_standardize.isChecked() else 'OFF'}\n"
+            f"Adam Health: heuristic diagnostic\n"
+            f"Target epochs: {self.spin_epochs.value()}\n"
+            f"Adam update steps: {metrics.get('iterations', 0)}\n"
             f"Adam loss reduction: {reduction_text}"
         )
-        reason_lines = [
-            "ADAM HEALTH",
-            *[f"- {reason}" for reason in diagnostic["reasons"]],
-        ]
-        if metrics:
-            reason_lines.extend([
-                "",
-                f"Best Adam training loss: {metrics['best_loss']:.6g} "
-                f"(iteration {metrics['best_iteration']})",
-                f"Final Adam training-loss trend: {metrics['final_loss']:.6g}",
-                f"Gradient ratio (end/start): {metrics['gradient_ratio']:.3g}",
-                f"Step ratio (end/start): {metrics['step_ratio']:.3g}",
-            ])
-            final_losses = metrics.get("final_losses", {})
-            if final_losses:
-                reason_lines.extend([
-                    "",
-                    "FIXED-CONFIG BENCHMARK",
-                    diagnostic["comparison_summary"],
-                    "All loss curves use the same held-out evaluation sample.",
-                    "Final evaluation-loss trend:",
-                    *[f"  {name}: {loss:.6g}" for name, loss in final_losses.items()],
-                ])
-        self.txt_adam_reasons.setPlainText("\n".join(reason_lines))
         self.btn_run_adam_check.setEnabled(True)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -749,18 +743,14 @@ class MainWindow(QMainWindow):
         self.cb_compare.blockSignals(False)
         # Sensible defaults per algorithm
         if name == "Newton Method":
-            self.spin_iter.setValue(30)
             self.spin_lr.setValue(1.0)
             self.spin_batch.setValue(2000)
         elif name == "Adam":
             self.spin_lr.setValue(0.001)
-            self.spin_iter.setValue(300)
         elif name == "Gradient Descent":
             self.spin_lr.setValue(0.01)
-            self.spin_iter.setValue(300)
         elif name == "SGD":
             self.spin_lr.setValue(0.01)
-            self.spin_iter.setValue(300)
 
     def _refresh_dataset_choices(self, task: str, preferred: str | None = None) -> bool:
         previous = self.cb_dataset.currentText()
@@ -787,6 +777,7 @@ class MainWindow(QMainWindow):
             self.btn_generate_dataset.setEnabled(False)
             self._on_model_changed()
             self._reset()
+            self._loaded_dataset_name = name
             self.status_label.setText(
                 f"Restored {name}: {len(self._y):,} samples × {self._X.shape[1]} features"
             )
@@ -799,14 +790,43 @@ class MainWindow(QMainWindow):
             name = self.cb_dataset.currentText()
         self.spin_dataset_size.setEnabled(True)
         self.btn_generate_dataset.setEnabled(True)
+        dataset_changed = name != self._loaded_dataset_name
+        if dataset_changed and name == ADAM_DEMO_DATASET:
+            self.spin_dataset_size.setValue(2000)
+            self.chk_standardize.setChecked(False)
+            self.spin_lr.setValue(0.01)
+            self.spin_epochs.setValue(10)
+            self.spin_batch.setValue(32)
+            self.lbl_scaling_note.setText(
+                "Adam demo: keep standardization OFF. Recommended: 2,000 samples, "
+                "LR 0.01, 10 epochs, batch 32. Turn it ON to remove the scale advantage."
+            )
+            self.lbl_scaling_note.setStyleSheet(
+                "font-size:9px;color:#d29922;padding:4px;"
+            )
+        elif dataset_changed:
+            self.chk_standardize.setChecked(True)
+            self.lbl_scaling_note.setText(
+                "Standardization fitted only on the training split."
+            )
+            self.lbl_scaling_note.setStyleSheet(
+                "font-size:9px;color:#8b949e;padding:4px;"
+            )
         requested_size = self.spin_dataset_size.value()
         self._X, self._y = DATASETS[name](n_samples=requested_size)
         self._X_model = self._X_train = self._X_test = None
         self._y_train = self._y_test = None
         self._on_model_changed()
         self._reset()
+        self._loaded_dataset_name = name
+        scaling = (
+            "standardization ON"
+            if self.chk_standardize.isChecked()
+            else "raw features"
+        )
         self.status_label.setText(
-            f"Generated {name}: {len(self._y):,} samples × {self._X.shape[1]} features"
+            f"Generated {name}: {len(self._y):,} samples × "
+            f"{self._X.shape[1]} features; {scaling}"
         )
 
     def _load_csv(self):
@@ -849,6 +869,11 @@ class MainWindow(QMainWindow):
             self._csv_dataset_name = dataset_name
             self._csv_task = model.task
             self._csv_X, self._csv_y = X.copy(), y.copy()
+            self._loaded_dataset_name = dataset_name
+            self.chk_standardize.setChecked(True)
+            self.lbl_scaling_note.setText(
+                "CSV features will be standardized from training-split statistics."
+            )
             self._refresh_dataset_choices(model.task, preferred=dataset_name)
             self.spin_dataset_size.setEnabled(False)
             self.btn_generate_dataset.setEnabled(False)
@@ -928,9 +953,14 @@ class MainWindow(QMainWindow):
                 task=model_task,
                 seed=42,
             )
-            self._X_train, self._X_test, self._X_model = standardize_from_training(
-                X_train, X_test, self._X
-            )
+            if self.chk_standardize.isChecked():
+                self._X_train, self._X_test, self._X_model = standardize_from_training(
+                    X_train, X_test, self._X
+                )
+            else:
+                self._X_train = X_train.copy()
+                self._X_test = X_test.copy()
+                self._X_model = self._X.copy()
         except ValueError as exc:
             self.status_label.setText(f"Cannot start experiment: {exc}")
             QMessageBox.warning(self, "Invalid train/test split", str(exc))
@@ -952,9 +982,6 @@ class MainWindow(QMainWindow):
         if "Adam" in algs:
             self.lbl_adam_verdict.setText("RUNNING…")
             self.lbl_optimizer_winner.setText("RUNNING…")
-            self.txt_adam_reasons.setPlainText(
-                "Zbieram wspólny test loss oraz historię gradientów i kroków."
-            )
             self.btn_run_adam_check.setEnabled(False)
         else:
             self._set_adam_diagnostic_placeholder(
@@ -990,13 +1017,20 @@ class MainWindow(QMainWindow):
             if alg_name == "Gradient Descent"
             else self.spin_batch.value()
         )
+        optimizer_steps = optimizer_steps_for_epochs(
+            self.spin_epochs.value(), len(self._y_train), batch_size
+        )
+        ui_emit_every = max(
+            self.spin_emit.value(),
+            int(np.ceil(optimizer_steps / 500)),
+        )
         w = TrainingWorker(
             model=model, optimizer=opt,
             X=self._X_train, y=self._y_train,
             X_eval=self._X_test, y_eval=self._y_test,
-            n_iterations=self.spin_iter.value(),
+            n_iterations=optimizer_steps,
             batch_size=batch_size,
-            emit_every=self.spin_emit.value(),
+            emit_every=ui_emit_every,
             random_seed=42,
         )
         w.step_done.connect(lambda p, n=alg_name: self._on_step(p, n))
@@ -1007,11 +1041,14 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(dict)
     def _on_step(self, payload: dict, name: str):
-        self._histories.setdefault(name, []).append(payload["loss"])
+        display_loss = payload.get("evaluation_loss", payload["loss"])
+        self._histories.setdefault(name, []).append(
+            (payload["epoch"], display_loss)
+        )
 
         if name == self._active_primary_algorithm:
-            self.stat_loss.set_value(payload["loss"])
-            self.stat_iter.set_value(payload["iteration"])
+            self.stat_loss.set_value(display_loss)
+            self.stat_iter.set_value(round(payload["epoch"], 2))
             self.stat_time.set_value(round(payload["elapsed"], 2))
             if "accuracy" in payload:
                 self.stat_acc.set_value(round(payload["accuracy"] * 100, 1))
@@ -1024,18 +1061,21 @@ class MainWindow(QMainWindow):
                 (params[0], params[1], payload["loss"])
             )
 
-        idx = self.tabs.currentIndex()
-        if idx == 0:
-            self._update_loss_tab()
-        elif idx == 2:
-            self._update_3d_tab()
+        if self.mode_tabs.currentIndex() == 0:
+            idx = self.tabs.currentIndex()
+            if idx == 0:
+                self._update_loss_tab()
+            elif idx == 2:
+                self._update_3d_tab()
 
     @pyqtSlot(dict)
     def _on_finished(self, payload: dict, name: str):
+        display_loss = payload.get("evaluation_loss", payload["loss"])
         self._stats[name] = {
-            "final_loss": payload["loss"],
+            "final_loss": display_loss,
             "time":       payload["elapsed"],
-            "iterations": payload["iteration"],
+            "steps":      payload["step"],
+            "epochs":     payload["epoch"],
             "accuracy":   payload.get("accuracy"),
             "r2":         payload.get("r2"),
             "rmse":       payload.get("rmse"),
@@ -1051,8 +1091,9 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             saved_message = f"  |  PNG save failed: {exc}"
         self.status_label.setText(
-            f"✔ {name}  loss={payload['loss']:.5f}"
-            f"  iters={payload['iteration']}  t={payload['elapsed']:.2f}s"
+            f"✔ {name}  eval_loss={display_loss:.5f}"
+            f"  epochs={payload['epoch']:.2f}  steps={payload['step']}"
+            f"  t={payload['elapsed']:.2f}s"
             f"{saved_message}"
         )
         self._finished_workers += 1
@@ -1067,9 +1108,6 @@ class MainWindow(QMainWindow):
             self.lbl_adam_verdict.setStyleSheet(
                 "font-size:25px;font-weight:bold;color:#f85149;padding:10px;"
                 "background:#161b22;border:1px solid #f85149;border-radius:8px;"
-            )
-            self.txt_adam_reasons.setPlainText(
-                f"Trening zakończył się wyjątkiem:\n{message}"
             )
             self.btn_run_adam_check.setEnabled(True)
         self._finish_experiment_if_ready()
@@ -1094,9 +1132,10 @@ class MainWindow(QMainWindow):
             self.spin_dataset_size,
             self.btn_generate_dataset,
             self.btn_csv,
+            self.chk_standardize,
             self.spin_ridge_lambda,
             self.spin_lr,
-            self.spin_iter,
+            self.spin_epochs,
             self.spin_batch,
             self.spin_emit,
             self.spin_test_split,

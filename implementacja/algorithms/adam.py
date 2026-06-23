@@ -14,16 +14,17 @@ Algorithm (per Kingma & Ba, Algorithm 1):
 
 WHAT THE ADAM CHECK DIAGNOSES ON A REAL TRAINING RUN:
 ────────────────────────────────────────────────────────────────────────
-1. LOSS TREND: loss on the shared evaluation split and its smoothed trend.
+1. LOSS TREND: Adam's mini-batch training loss and its smoothed trend.
 2. GRADIENT NORM: whether the optimization signal is shrinking.
 3. PARAMETER-STEP NORM: whether Adam settles near a solution or keeps jumping.
 4. REGRESSION FROM THE BEST POINT: whether the final iterations undo progress.
 5. NUMERICAL HEALTH: NaN, infinity, explosion, stagnation, and instability.
 
-The diagnosis uses the exact model, dataset and optimizer history produced by
-the Optimization tab. The optimizer benchmark uses one shared evaluation split
-and does not change Adam's health verdict. It does not run separate synthetic
-failure scenarios.
+The heuristic health diagnosis uses the exact model, dataset and optimizer
+history produced by the Optimization tab. The separate optimizer benchmark
+uses one shared held-out sample and a common processed-data budget expressed
+as epochs. It does not change Adam's health verdict and does not run
+separate synthetic failure scenarios.
 """
 import numpy as np
 from .base import BaseOptimizer

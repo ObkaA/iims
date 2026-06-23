@@ -16,6 +16,23 @@ def generate_linear_regression(n_samples: int = 200, noise: float = 0.3, seed: i
     return X, y
 
 
+def generate_ill_conditioned_regression(
+    n_samples: int = 2000,
+    feature_scale: float = 10.0,
+    noise: float = 0.3,
+    seed: int = 42,
+):
+    """Regression with an elongated loss surface for demonstrating Adam."""
+    rng = np.random.default_rng(seed)
+    X = rng.normal(0.0, feature_scale, size=(n_samples, 1))
+    y = (
+        1.0
+        + (3.0 / feature_scale) * X[:, 0]
+        + rng.normal(0.0, noise, size=n_samples)
+    )
+    return X, y
+
+
 def generate_nonlinear_regression(n_samples: int = 200, noise: float = 0.3, seed: int = 42):
     """y = 2·sin(x) + ε"""
     rng = np.random.default_rng(seed)
@@ -84,6 +101,7 @@ DATASETS = {
     "Noisy Linear Data": lambda n_samples=200: generate_linear_regression(
         n_samples=n_samples, noise=1.2
     ),
+    "Ill-conditioned Linear (Adam demo)": generate_ill_conditioned_regression,
     "Logistic 2D":       generate_logistic_regression,
     "Circles":           generate_circles,
 }
@@ -91,6 +109,7 @@ DATASETS = {
 DATASET_TASKS = {
     "Linear Data": "regression",
     "Noisy Linear Data": "regression",
+    "Ill-conditioned Linear (Adam demo)": "regression",
     "Logistic 2D": "classification",
     "Circles": "classification",
 }

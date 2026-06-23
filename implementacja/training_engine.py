@@ -10,6 +10,14 @@ MAX_DIAGNOSTIC_EVAL_SAMPLES = 512
 MAX_DIAGNOSTIC_POINTS = 300
 
 
+def optimizer_steps_for_epochs(epochs: float, train_size: int, batch_size: int) -> int:
+    """Convert a data budget in epochs into optimizer update steps."""
+    if epochs <= 0 or train_size <= 0 or batch_size <= 0:
+        raise ValueError("Epochs, train size and batch size must be positive.")
+    effective_batch = min(batch_size, train_size)
+    return max(1, int(np.ceil(epochs * train_size / effective_batch)))
+
+
 class TrainingWorker(QThread):
     """Runs one optimiser × model combination and emits progress signals."""
 
@@ -34,16 +42,22 @@ class TrainingWorker(QThread):
         self._stopped     = False
         self.start_time   = None
 
-        eval_size = len(self.y_eval)
-        if eval_size > MAX_DIAGNOSTIC_EVAL_SAMPLES:
-            diagnostic_indices = np.linspace(
-                0, eval_size - 1, MAX_DIAGNOSTIC_EVAL_SAMPLES, dtype=int
-            )
-            self._X_diagnostic = self.X_eval[diagnostic_indices]
-            self._y_diagnostic = self.y_eval[diagnostic_indices]
-        else:
-            self._X_diagnostic = self.X_eval
-            self._y_diagnostic = self.y_eval
+        self._X_diagnostic, self._y_diagnostic = self._diagnostic_sample(
+            self.X_eval, self.y_eval
+        )
+        self._X_gradient_diagnostic, self._y_gradient_diagnostic = (
+            self._diagnostic_sample(self.X, self.y)
+        )
+
+    @staticmethod
+    def _diagnostic_sample(X, y):
+        size = len(y)
+        if size <= MAX_DIAGNOSTIC_EVAL_SAMPLES:
+            return X, y
+        indices = np.linspace(
+            0, size - 1, MAX_DIAGNOSTIC_EVAL_SAMPLES, dtype=int
+        )
+        return X[indices], y[indices]
 
     def pause(self):  self._paused = not self._paused
     def stop(self):   self._stopped = True; self._paused = False
@@ -61,6 +75,9 @@ class TrainingWorker(QThread):
         diagnostic_every = max(
             1, int(np.ceil(self.n_iterations / MAX_DIAGNOSTIC_POINTS))
         )
+        last_evaluation_loss = None
+        opt.history["samples_per_step"] = min(self.batch_size, n)
+        opt.history["train_size"] = n
 
         for i in range(self.n_iterations):
             while self._paused and not self._stopped:
@@ -93,14 +110,25 @@ class TrainingWorker(QThread):
                 # All optimizers use the same deterministic held-out sample.
                 # Sampling and limiting the number of points keeps large CSV
                 # experiments responsive without influencing the updates.
-                opt.history["eval_loss"].append(float(model.loss(
+                last_evaluation_loss = float(model.loss(
                     new_params, self._X_diagnostic, self._y_diagnostic
-                )))
+                ))
+                opt.history["eval_loss"].append(last_evaluation_loss)
                 opt.history["eval_iteration"].append(i)
+                diagnostic_gradient = model.gradient(
+                    new_params,
+                    self._X_gradient_diagnostic,
+                    self._y_gradient_diagnostic,
+                )
+                opt.history["diagnostic_gradient_norm"].append(
+                    float(np.linalg.norm(diagnostic_gradient))
+                )
             model.params = new_params
 
             if i % self.emit_every == 0 or i == self.n_iterations - 1:
-                self.step_done.emit(self._payload(loss, new_params, i))
+                self.step_done.emit(self._payload(
+                    loss, new_params, i, evaluation_loss=last_evaluation_loss
+                ))
                 time.sleep(0.01)
 
         elapsed = time.time() - self.start_time
@@ -109,16 +137,21 @@ class TrainingWorker(QThread):
             model.params,
             len(opt.history["loss"]) - 1,
             elapsed=elapsed,
+            evaluation_loss=last_evaluation_loss,
         ))
 
-    def _payload(self, loss, params, iteration, elapsed=None):
+    def _payload(self, loss, params, iteration, elapsed=None, evaluation_loss=None):
         p = {
             "loss":      float(loss),
             "params":    params.copy(),
             "iteration": iteration,
+            "step":      iteration + 1,
+            "epoch":     (iteration + 1) * min(self.batch_size, len(self.y)) / len(self.y),
             "elapsed":   elapsed or (time.time() - self.start_time),
             "optimizer": self.optimizer.name,
         }
+        if evaluation_loss is not None:
+            p["evaluation_loss"] = float(evaluation_loss)
         if hasattr(self.model, "accuracy"):
             p["accuracy"] = self.model.accuracy(self.X_eval, self.y_eval)
         elif self.model.task == "regression":

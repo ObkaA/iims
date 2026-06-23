@@ -10,10 +10,15 @@ sys.path.insert(0, str(PROJECT_ROOT / "implementacja"))
 
 from algorithms.gradient_descent import GradientDescent
 from models.linear_regression import LinearRegressionModel
-from training_engine import TrainingWorker
+from training_engine import TrainingWorker, optimizer_steps_for_epochs
 
 
 class TrainingEngineDiagnosticsTests(unittest.TestCase):
+    def test_epochs_are_converted_to_optimizer_steps(self):
+        self.assertEqual(optimizer_steps_for_epochs(60, 160, 32), 300)
+        self.assertEqual(optimizer_steps_for_epochs(60, 160, 160), 60)
+        self.assertEqual(optimizer_steps_for_epochs(1, 10, 3), 4)
+
     def _run_minibatch_gd(self, X, y, seed):
         model = LinearRegressionModel()
         model.fit_data(X, y)
@@ -72,3 +77,9 @@ class TrainingEngineDiagnosticsTests(unittest.TestCase):
         np.testing.assert_allclose(worker_model.params, params)
         self.assertEqual(len(worker_optimizer.history["eval_loss"]), 5)
         self.assertEqual(worker_optimizer.history["eval_iteration"], list(range(5)))
+        self.assertEqual(
+            len(worker_optimizer.history["diagnostic_gradient_norm"]), 5
+        )
+        self.assertTrue(np.isfinite(
+            worker_optimizer.history["diagnostic_gradient_norm"]
+        ).all())

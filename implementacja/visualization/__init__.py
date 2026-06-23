@@ -94,18 +94,38 @@ def plot_confusion_matrix(
 
 
 # ── Loss curve ────────────────────────────────────────────────────────────────
-def plot_loss_curves(histories: dict[str, list[float]], fig: Figure | None = None) -> Figure:
-    """histories = {"Optimizer Name": [loss_t0, loss_t1, …]}"""
+def plot_loss_curves(histories: dict[str, list], fig: Figure | None = None) -> Figure:
+    """Plot loss against epochs; legacy lists of losses remain supported."""
     if fig is None:
         fig = Figure(figsize=(6, 3.5), tight_layout=True)
     fig.clear()
     ax = fig.add_subplot(111)
-    for name, losses in histories.items():
+    all_positive = True
+    for name, history in histories.items():
         color = COLORS.get(name, "#ffffff")
-        ax.plot(losses, label=name, color=color, linewidth=2, alpha=0.9)
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Loss")
-    ax.set_title("Loss Curve", fontsize=12, fontweight="bold")
+        if history and isinstance(history[0], (tuple, list)):
+            epochs, losses = zip(*history)
+        else:
+            losses = history
+            epochs = range(1, len(losses) + 1)
+        losses = np.asarray(losses, dtype=float)
+        epochs = np.asarray(list(epochs), dtype=float)
+        if losses.size == 0:
+            continue
+        all_positive = all_positive and bool(np.all(losses > 0))
+        span = max(3, min(21, losses.size // 12 or 3))
+        alpha = 2.0 / (span + 1.0)
+        smooth = np.empty_like(losses)
+        smooth[0] = losses[0]
+        for index in range(1, losses.size):
+            smooth[index] = alpha * losses[index] + (1.0 - alpha) * smooth[index - 1]
+        ax.plot(epochs, losses, color=color, linewidth=0.8, alpha=0.16)
+        ax.plot(epochs, smooth, label=name, color=color, linewidth=2, alpha=0.95)
+    if all_positive:
+        ax.set_yscale("log")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Evaluation loss" + (" (log)" if all_positive else ""))
+    ax.set_title("Smoothed Evaluation Loss", fontsize=12, fontweight="bold")
     ax.legend(framealpha=0.8)
     _apply_dark(fig)
     return fig

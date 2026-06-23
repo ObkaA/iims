@@ -22,6 +22,8 @@ OPTIMIZER_COLORS = {
     "SGD": "#ff6b6b",
     "Gradient Descent": "#00d4ff",
 }
+TIE_RELATIVE_TOLERANCE = 0.01
+STEP_NORM_FLOOR = 1e-12
 
 
 def _ema(values: np.ndarray, span: int) -> np.ndarray:
@@ -89,6 +91,51 @@ def _project_parameter_trajectories(histories: dict[str, dict]) -> dict:
         "mode": "PCA",
         "x_label": "PC1",
         "y_label": "PC2",
+    }
+
+
+def build_parameter_loss_contours(
+    model,
+    X: np.ndarray,
+    y: np.ndarray,
+    histories: dict[str, dict],
+    resolution: int = 45,
+) -> dict | None:
+    """Build an explicitly approximate loss surface for a 2-parameter model."""
+    paths = []
+    for history in histories.values():
+        for value in history.get("params", []):
+            params = np.asarray(value, dtype=float).reshape(-1)
+            if params.size != 2:
+                return None
+            paths.append(params)
+    if not paths:
+        return None
+
+    points = np.vstack(paths)
+    lower = np.min(points, axis=0)
+    upper = np.max(points, axis=0)
+    span = np.maximum(upper - lower, 0.5)
+    lower = lower - 0.12 * span
+    upper = upper + 0.12 * span
+    theta0 = np.linspace(lower[0], upper[0], resolution)
+    theta1 = np.linspace(lower[1], upper[1], resolution)
+    grid0, grid1 = np.meshgrid(theta0, theta1)
+    loss = np.empty_like(grid0)
+    for row in range(resolution):
+        for column in range(resolution):
+            params = np.array([grid0[row, column], grid1[row, column]])
+            loss[row, column] = model.loss(params, X, y)
+    minimum_index = np.unravel_index(np.argmin(loss), loss.shape)
+    return {
+        "theta0": grid0,
+        "theta1": grid1,
+        "loss": loss,
+        "minimum": np.array([
+            grid0[minimum_index], grid1[minimum_index]
+        ]),
+        "minimum_loss": float(loss[minimum_index]),
+        "label": "estimated grid minimum",
     }
 
 
@@ -172,13 +219,18 @@ def analyze_adam_history(history: dict) -> dict:
         / max(abs(float(np.mean(tail))), epsilon)
     )
     peak_ratio = float(np.max(np.abs(smooth_loss)) / max(abs(initial_loss), epsilon))
+    samples_per_step = max(1, int(history.get("samples_per_step", 1)))
+    train_size = max(1, int(history.get("train_size", samples_per_step)))
+    epoch_per_step = samples_per_step / train_size
 
     metrics = {
         "iterations": int(losses.size),
+        "epochs": float(losses.size * epoch_per_step),
         "initial_loss": initial_loss,
         "final_loss": final_loss,
         "best_loss": best_loss,
         "best_iteration": best_index,
+        "best_epoch": float((best_index + 1) * epoch_per_step),
         "loss_reduction": reduction,
         "regression_from_best": regression_from_best,
         "increase_fraction": increase_fraction,
@@ -250,25 +302,51 @@ def analyze_optimizer_comparison(histories: dict[str, dict]) -> dict:
     }
     trajectory = _project_parameter_trajectories(histories)
     for name, run in runs.items():
+        history = histories[name]
+        samples_per_step = max(1, int(history.get("samples_per_step", 1)))
+        train_size = max(1, int(history.get("train_size", samples_per_step)))
+        epoch_per_step = samples_per_step / train_size
         evaluation_losses = np.asarray(
-            histories[name].get("eval_loss", []), dtype=float
+            history.get("eval_loss", []), dtype=float
         )
         if evaluation_losses.size >= 3:
             span = max(3, min(21, evaluation_losses.size // 12 or 3))
             evaluation_iterations = np.asarray(
-                histories[name].get("eval_iteration", []), dtype=int
+                history.get("eval_iteration", []), dtype=int
             )
             if evaluation_iterations.size != evaluation_losses.size:
                 evaluation_iterations = np.arange(evaluation_losses.size)
             run["comparison_losses"] = evaluation_losses
             run["smooth_comparison_loss"] = _ema(evaluation_losses, span)
             run["comparison_iterations"] = evaluation_iterations
+            run["comparison_epochs"] = (
+                evaluation_iterations + 1
+            ) * epoch_per_step
             run["comparison_loss_source"] = "evaluation"
         else:
             run["comparison_losses"] = run["losses"]
             run["smooth_comparison_loss"] = run["smooth_loss"]
             run["comparison_iterations"] = np.arange(run["losses"].size)
+            run["comparison_epochs"] = (
+                np.arange(run["losses"].size) + 1
+            ) * epoch_per_step
             run["comparison_loss_source"] = "training fallback"
+        diagnostic_gradient_norms = np.asarray(
+            history.get("diagnostic_gradient_norm", []), dtype=float
+        )
+        if diagnostic_gradient_norms.size == run["comparison_iterations"].size:
+            run["comparison_gradient_norms"] = diagnostic_gradient_norms
+            run["comparison_gradient_epochs"] = run["comparison_epochs"]
+            run["gradient_source"] = "shared training sample"
+        else:
+            run["comparison_gradient_norms"] = run["gradient_norms"]
+            run["comparison_gradient_epochs"] = (
+                np.arange(run["gradient_norms"].size) + 1
+            ) * epoch_per_step
+            run["gradient_source"] = "mini-batch fallback"
+        run["step_epochs"] = (
+            np.arange(run["step_norms"].size) + 1
+        ) * epoch_per_step
     adam = runs.get("Adam")
     if adam is None or adam["verdict"] == "NO DATA":
         return {
@@ -292,31 +370,65 @@ def analyze_optimizer_comparison(histories: dict[str, dict]) -> dict:
     comparison_summary = "Run SGD and Gradient Descent to compare optimizers."
 
     if len(usable_runs) > 1:
-        final_losses = {}
+        shared_budget = min(
+            float(result["comparison_epochs"][-1])
+            for result in usable_runs.values()
+        )
+        budget_losses = {}
         for name, result in usable_runs.items():
-            trend = result["smooth_comparison_loss"]
-            window = max(3, min(25, trend.size // 5))
-            final_losses[name] = float(np.median(trend[-window:]))
-        ranking = sorted(final_losses, key=final_losses.get)
-        winner = ranking[0]
-        winner_loss = final_losses[winner]
-        adam_loss = final_losses["Adam"]
-        denominator = max(abs(winner_loss), np.finfo(float).eps)
-        adam_gap = (adam_loss - winner_loss) / denominator
+            budget_losses[name] = float(np.interp(
+                shared_budget,
+                result["comparison_epochs"],
+                result["smooth_comparison_loss"],
+            ))
+        ranking = sorted(budget_losses, key=budget_losses.get)
+        best_name = ranking[0]
+        best_loss = budget_losses[best_name]
+        tie_margin = max(abs(best_loss) * TIE_RELATIVE_TOLERANCE, 1e-12)
+        tied_names = [
+            name for name in ranking
+            if budget_losses[name] - best_loss <= tie_margin
+        ]
+        comparison_label = (
+            f"TIE: {' / '.join(tied_names)}"
+            if len(tied_names) > 1 else best_name
+        )
+        comparison_winner = best_name if len(tied_names) == 1 else None
+        adam_loss = budget_losses["Adam"]
+        denominator = max(abs(best_loss), np.finfo(float).eps)
+        adam_gap = (adam_loss - best_loss) / denominator
+        adam_rank = 1 + sum(
+            loss < adam_loss - tie_margin
+            for loss in budget_losses.values()
+        )
         metrics.update({
             "adam_final_loss": adam_loss,
-            "comparison_winner": winner,
-            "winner_loss": winner_loss,
-            "adam_rank": ranking.index("Adam") + 1,
+            "comparison_winner": comparison_winner,
+            "comparison_winners": tied_names,
+            "comparison_label": comparison_label,
+            "winner_loss": best_loss,
+            "adam_rank": adam_rank,
             "ranking": ranking,
             "adam_baseline_gap": adam_gap,
-            "final_losses": final_losses,
+            "final_losses": budget_losses,
+            "shared_budget_epochs": shared_budget,
+            "tie_tolerance": TIE_RELATIVE_TOLERANCE,
         })
-        if winner == "Adam":
-            comparison_summary = "Adam uzyskał najniższy końcowy loss w tym benchmarku."
+        if len(tied_names) > 1:
+            comparison_summary = (
+                f"Remis w tolerancji {TIE_RELATIVE_TOLERANCE * 100:.0f}% przy "
+                f"wspólnym budżecie {shared_budget:.2f} epok: "
+                f"{', '.join(tied_names)}."
+            )
+        elif comparison_winner == "Adam":
+            comparison_summary = (
+                f"Adam uzyskał najniższy loss przy wspólnym budżecie "
+                f"{shared_budget:.2f} epok."
+            )
         else:
             comparison_summary = (
-                f"Najniższy końcowy loss uzyskał {winner}. Adam zajął "
+                f"Najniższy loss przy {shared_budget:.2f} epok uzyskał "
+                f"{comparison_winner}. Adam zajął "
                 f"miejsce {metrics['adam_rank']}/{len(ranking)}. Nie zmienia to "
                 "werdyktu Adam Health."
             )
@@ -335,8 +447,7 @@ def analyze_optimizer_comparison(histories: dict[str, dict]) -> dict:
 def plot_optimizer_comparison(comparison: dict, fig: Figure) -> Figure:
     """Draw Adam, SGD and GD diagnostics on common axes."""
     fig.clear()
-    axes = fig.subplots(2, 3)
-    ax_loss, ax_trajectory, ax_final, ax_gradient, ax_step, ax_summary = axes.flat
+    ax_loss, ax_trajectory, ax_final = fig.subplots(1, 3)
     runs = comparison.get("runs", {})
 
     usable = {
@@ -349,39 +460,25 @@ def plot_optimizer_comparison(comparison: dict, fig: Figure) -> Figure:
             ha="center", va="center", transform=ax_loss.transAxes,
             color=PALETTE["text"], fontsize=12,
         )
-        for axis in (ax_trajectory, ax_gradient, ax_step, ax_final, ax_summary):
+        for axis in (ax_trajectory, ax_final):
             axis.set_visible(False)
     else:
         for name, run in usable.items():
             color = OPTIMIZER_COLORS[name]
             comparison_loss = run["smooth_comparison_loss"]
-            comparison_iterations = run["comparison_iterations"]
+            comparison_epochs = run["comparison_epochs"]
             ax_loss.semilogy(
-                comparison_iterations,
+                comparison_epochs,
                 np.maximum(comparison_loss, np.finfo(float).tiny),
                 color=color, lw=2.0, label=name,
             )
-            iterations = np.arange(run["gradient_norms"].size)
-            ax_gradient.semilogy(
-                iterations,
-                np.maximum(run["gradient_norms"], np.finfo(float).tiny),
-                color=color, lw=1.6, label=name,
-            )
-            ax_step.semilogy(
-                iterations,
-                np.maximum(run["step_norms"], np.finfo(float).tiny),
-                color=color, lw=1.6, label=name,
-            )
 
-        ax_loss.set_title("Smoothed evaluation loss — lower is better", fontweight="bold")
-        ax_loss.set_xlabel("Iteration")
+        ax_loss.set_title(
+            "Smoothed evaluation loss\n(lower is better)",
+            fontsize=10, fontweight="bold",
+        )
+        ax_loss.set_xlabel("Epoch")
         ax_loss.set_ylabel("Loss (log)")
-        ax_gradient.set_title("Gradient norm", fontweight="bold")
-        ax_gradient.set_xlabel("Iteration")
-        ax_gradient.set_ylabel("||gradient|| (log)")
-        ax_step.set_title("Parameter-step norm", fontweight="bold")
-        ax_step.set_xlabel("Iteration")
-        ax_step.set_ylabel("||Δθ|| (log)")
 
         final_loss_map = comparison.get("metrics", {}).get("final_losses", {})
         names = [name for name in usable if name in final_loss_map]
@@ -391,13 +488,33 @@ def plot_optimizer_comparison(comparison: dict, fig: Figure) -> Figure:
             color=[OPTIMIZER_COLORS[name] for name in names], alpha=0.85,
         )
         ax_final.bar_label(bars, fmt="%.4g", color=PALETTE["text"], fontsize=8)
-        ax_final.set_title("Final evaluation-loss trend", fontweight="bold")
+        shared_budget = comparison.get("metrics", {}).get("shared_budget_epochs")
+        budget_label = "shared budget" if shared_budget is None else f"{shared_budget:.2f} epochs"
+        ax_final.set_title(
+            f"Evaluation loss at {budget_label}",
+            fontsize=10, fontweight="bold",
+        )
         ax_final.set_ylabel("Loss")
         ax_final.tick_params(axis="x", labelrotation=12)
+        if shared_budget is not None:
+            ax_loss.axvline(
+                shared_budget, color=PALETTE["warning"], lw=0.9,
+                ls="--", alpha=0.75,
+            )
 
         trajectory = comparison.get("trajectory", {})
         paths = trajectory.get("paths", {})
-        winner = comparison.get("metrics", {}).get("comparison_winner")
+        loss_surface = comparison.get("loss_surface")
+        if loss_surface and trajectory.get("mode") == "direct":
+            ax_trajectory.contourf(
+                loss_surface["theta0"], loss_surface["theta1"],
+                loss_surface["loss"], levels=18, cmap="Blues", alpha=0.22,
+            )
+            ax_trajectory.contour(
+                loss_surface["theta0"], loss_surface["theta1"],
+                loss_surface["loss"], levels=9,
+                colors=PALETTE["grid"], linewidths=0.55, alpha=0.8,
+            )
         for name, path in paths.items():
             if name not in OPTIMIZER_COLORS or path.size == 0:
                 continue
@@ -415,13 +532,19 @@ def plot_optimizer_comparison(comparison: dict, fig: Figure) -> Figure:
             )
             ax_trajectory.scatter(
                 shown[-1, 0], shown[-1, 1], color=color,
-                marker="*" if name == winner else "X",
-                s=100 if name == winner else 55, zorder=5,
+                marker="X", s=55, zorder=5,
+            )
+        if loss_surface and trajectory.get("mode") == "direct":
+            minimum = loss_surface["minimum"]
+            ax_trajectory.scatter(
+                minimum[0], minimum[1], color="#ffd700", marker="*",
+                edgecolor=PALETTE["text"], linewidth=0.6, s=120,
+                zorder=7, label=loss_surface["label"],
             )
         mode = trajectory.get("mode", "unavailable")
         ax_trajectory.set_title(
             "Parameter trajectory" + (" (PCA)" if mode == "PCA" else ""),
-            fontweight="bold",
+            fontsize=10, fontweight="bold",
         )
         ax_trajectory.set_xlabel(trajectory.get("x_label", ""))
         ax_trajectory.set_ylabel(trajectory.get("y_label", ""))
@@ -432,15 +555,16 @@ def plot_optimizer_comparison(comparison: dict, fig: Figure) -> Figure:
             )
             for label in trajectory_legend.get_texts():
                 label.set_color(PALETTE["text"])
-
-        ax_summary.axis("off")
-        ax_summary.text(
-            0.02, 0.95,
-            "How to read the trajectory\n\n"
-            "○ start\nX final position\n★ benchmark winner\n\n"
-            "PCA is used only when the model\nhas more than two parameters.",
-            transform=ax_summary.transAxes, va="top", ha="left",
-            color=PALETTE["muted"], fontsize=9, linespacing=1.45,
+        marker_help = "○ start   X final"
+        if loss_surface and trajectory.get("mode") == "direct":
+            marker_help += "   ★ estimated minimum"
+        else:
+            marker_help += "   (shared PCA projection)"
+        ax_trajectory.text(
+            0.02, 0.02, marker_help,
+            transform=ax_trajectory.transAxes, ha="left", va="bottom",
+            color=PALETTE["muted"], fontsize=7,
+            bbox={"facecolor": PALETTE["surface"], "alpha": 0.75, "edgecolor": "none"},
         )
 
     for axis in fig.axes:
@@ -466,13 +590,13 @@ def plot_optimizer_comparison(comparison: dict, fig: Figure) -> Figure:
             label.set_color(PALETTE["text"])
 
     fig.patch.set_facecolor(PALETTE["bg"])
-    winner = comparison.get("metrics", {}).get("comparison_winner", "—")
+    comparison_label = comparison.get("metrics", {}).get("comparison_label", "—")
     fig.suptitle(
-        f"Adam health: {comparison['verdict']}  |  Benchmark winner: {winner}",
+        f"Adam health (heuristic): {comparison['verdict']}  |  Benchmark: {comparison_label}",
         color=comparison["color"], fontsize=12, fontweight="bold",
     )
     if usable:
-        fig.tight_layout(rect=(0, 0, 1, 0.96))
+        fig.tight_layout(rect=(0, 0, 1, 0.96), pad=1.2, w_pad=2.0, h_pad=2.0)
     else:
         ax_loss.set_position([0.10, 0.12, 0.82, 0.76])
     return fig
